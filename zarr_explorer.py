@@ -108,6 +108,58 @@ def _get_dir_size_mb(path: str) -> float:
 # Tree builder
 # ---------------------------------------------------------------------------
 
+def _build_metadata_node(node_attrs: dict, depth: int, search_filter: str, group_path: str) -> list:
+    """Build a virtual [metadata] collapsible node from EOPF other_metadata scalars."""
+    other_metadata = node_attrs.get("other_metadata", {})
+    if not isinstance(other_metadata, dict):
+        return []
+    sf = search_filter.lower().strip() if search_filter else ""
+    meta_items = []
+    for key, val in other_metadata.items():
+        if not (isinstance(val, dict) and "data" in val and val.get("dims") == []):
+            continue
+        if sf and sf not in key.lower():
+            continue
+        data_val = val["data"]
+        dtype = val.get("dtype", "")
+        units = val.get("attrs", {}).get("units", "")
+        suffix = "  [" + ", ".join(x for x in [dtype, units] if x) + "]" if (dtype or units) else ""
+        meta_items.append(
+            html.Div(
+                html.Span(
+                    f"{key}: {data_val}{suffix}",
+                    style={"fontSize": "11px", "fontFamily": "monospace",
+                           "color": "#6c757d", "padding": "2px 6px", "display": "block"},
+                ),
+                style={"paddingLeft": f"{(depth + 1) * 14}px", "borderBottom": "1px solid #dee2e6"},
+            )
+        )
+    if not meta_items:
+        return []
+    meta_id = f"__meta__{group_path}"
+    return [html.Div([
+        dbc.Button(
+            [
+                html.Span("\u25BE ", id={"type": "group-arrow", "index": meta_id},
+                          style={"fontSize": "10px", "display": "inline-block",
+                                 "transition": "transform 0.15s"}),
+                "[metadata]",
+            ],
+            id={"type": "group-toggle", "index": meta_id},
+            color="link", size="sm", class_name="text-start w-100",
+            style={
+                "fontSize": "11px", "fontFamily": "monospace", "fontStyle": "italic",
+                "color": "#6c757d",
+                "padding": f"3px 6px 3px {depth * 14 + 6}px",
+                "background": "#f8f9fa",
+                "borderBottom": "1px solid #dee2e6",
+                "borderRadius": "0",
+            },
+        ),
+        dbc.Collapse(meta_items, id={"type": "group-collapse", "index": meta_id}, is_open=False),
+    ])]
+
+
 def build_tree(node: zarr.Group | zarr.Array, path: str = "", depth: int = 0,
                search_filter: str = "") -> list:
     """Build tree of variable buttons. If search_filter is set, only show matching arrays."""
@@ -154,7 +206,8 @@ def build_tree(node: zarr.Group | zarr.Array, path: str = "", depth: int = 0,
         else:
             # Recurse into group - if filtering, only show group if it has matching children
             child_items = build_tree(child, child_path, depth + 1, search_filter=sf)
-            if sf and not child_items:
+            child_meta = _build_metadata_node(dict(child.attrs), depth + 1, sf, child_path)
+            if sf and not child_items and not child_meta:
                 continue
             items.append(html.Div([
                 dbc.Button(
@@ -182,7 +235,7 @@ def build_tree(node: zarr.Group | zarr.Array, path: str = "", depth: int = 0,
                     },
                 ),
                 dbc.Collapse(
-                    child_items,
+                    child_items + child_meta,
                     id={"type": "group-collapse", "index": child_path},
                     is_open=True,  # always start open (user can collapse manually)
                 ),
@@ -795,31 +848,41 @@ def _get_file_vars(path: str) -> list[dict]:
         for arr_info in collect_arrays(s):
             node = s[arr_info["value"]]
             attrs = dict(node.attrs)
+            eopf = attrs.get("_eopf_attrs", {}) if isinstance(attrs.get("_eopf_attrs"), dict) else {}
             result.append({
                 "path": arr_info["value"],
                 "name": arr_info["value"].split("/")[-1],
                 "shape": str(node.shape),
                 "dtype": str(node.dtype),
-                "logical_dtype": attrs.get("dtype", ""),  # EOPF logical type e.g. 'byte', 'short'
+                "logical_dtype": attrs.get("dtype", eopf.get("dtype", "")),  # EOPF logical type e.g. 'byte', 'short'
                 "units": attrs.get("units", ""),
                 "long_name": attrs.get("long_name", attrs.get("standard_name", "")),
-                "scale_factor": attrs.get("scale_factor", None),
+                "scale_factor": attrs.get("scale_factor", eopf.get("scale_factor", None)),
             })
         return result
     else:
-        import xarray as xr
-        ds = xr.open_dataset(path, engine="netcdf4", mask_and_scale=False)
+        import netCDF4 as _nc4
         result = []
-        for name, var in ds.data_vars.items():
-            result.append({
-                "path": name,
-                "name": name,
-                "shape": str(tuple(var.shape)),
-                "dtype": str(var.dtype),
-                "units": var.attrs.get("units", ""),
-                "long_name": var.attrs.get("long_name", var.attrs.get("standard_name", "")),
-                "scale_factor": var.attrs.get("scale_factor", None),
-            })
+
+        def _collect_nc_vars(grp, prefix=""):
+            for name, var in grp.variables.items():
+                path = f"{prefix}/{name}" if prefix else name
+                attrs = {k: var.getncattr(k) for k in var.ncattrs()}
+                result.append({
+                    "path": path,
+                    "name": name,
+                    "shape": str(tuple(var.shape)),
+                    "dtype": str(var.dtype),
+                    "units": attrs.get("units", ""),
+                    "long_name": attrs.get("long_name", attrs.get("standard_name", "")),
+                    "scale_factor": attrs.get("scale_factor", None),
+                })
+            for grp_name, child in grp.groups.items():
+                child_prefix = f"{prefix}/{grp_name}" if prefix else grp_name
+                _collect_nc_vars(child, child_prefix)
+
+        ds = _nc4.Dataset(path)
+        _collect_nc_vars(ds)
         ds.close()
         return result
 
@@ -859,6 +922,11 @@ def _auto_detect_tolerance(var: dict) -> str:
 
 def _auto_match(vars_a: list[dict], vars_b: list[dict]) -> list[dict]:
     """Auto-match variables from file A to file B using name + shape scoring."""
+    def _chain_segs(path: str) -> frozenset[str]:
+        """Return short alphanumeric path segments that look like chain IDs (ka, ku1, ku2 …)."""
+        parts = path.lower().split("/")[:-1]  # exclude variable name
+        return frozenset(p for p in parts if p and len(p) <= 4 and p.isalnum())
+
     def _score(a: dict, b: dict) -> float:
         if a["path"] == b["path"]:
             return 1.0  # identical full path (same file or mirrored layout)
@@ -866,12 +934,22 @@ def _auto_match(vars_a: list[dict], vars_b: list[dict]) -> list[dict]:
         name_b = b["name"].lower()
         path_b = b["path"].lower()
         if name_a == name_b:
-            return 0.95
-        if name_a in path_b.split("/"):
-            return 0.90
-        ratio = difflib.SequenceMatcher(None, name_a, name_b).ratio()
-        shape_bonus = 0.05 if a["shape"] == b["shape"] else 0.0
-        return min(ratio + shape_bonus, 0.84)  # cap below high-confidence threshold
+            score = 0.95
+        elif name_a in path_b.split("/"):
+            score = 0.90
+        else:
+            ratio = difflib.SequenceMatcher(None, name_a, name_b).ratio()
+            shape_bonus = 0.05 if a["shape"] == b["shape"] else 0.0
+            score = min(ratio + shape_bonus, 0.84)  # cap below high-confidence threshold
+        # Chain-aware adjustment: boost same-chain, block cross-chain
+        chains_a = _chain_segs(a["path"])
+        chains_b = _chain_segs(b["path"])
+        if chains_a and chains_b:
+            if chains_a & chains_b:  # share at least one chain segment (e.g. both ku1)
+                score = min(score + 0.04, 1.0)
+            else:  # different chain IDs (e.g. ku1 vs ka) → prevent match
+                score = 0.0
+        return score
 
     # Compute best match for each A var
     candidates = []
@@ -987,17 +1065,34 @@ def _load_var_data(file_path: str, var_path: str, apply_scale: bool = True,
         data = _apply_time_slice(data, axis, time_slice)
     else:
         import xarray as xr
-        ds = xr.open_dataset(file_path, engine="netcdf4",
-                              mask_and_scale=bool(apply_scale))
-        var = ds[var_path]
+        # var_path may include a group prefix, e.g. "ku1/cal1_power_waveform"
+        parts = var_path.split("/")
+        if len(parts) > 1:
+            group = "/".join(parts[:-1])
+            var_name = parts[-1]
+            ds = xr.open_dataset(file_path, engine="netcdf4", group=group,
+                                  mask_and_scale=bool(apply_scale))
+        else:
+            var_name = var_path
+            ds = xr.open_dataset(file_path, engine="netcdf4",
+                                  mask_and_scale=bool(apply_scale))
+        var = ds[var_name]
         # detect time dim by name from xarray dimension names
         axis: int | None = None
         for i, dim in enumerate(var.dims):
             if _TIME_DIM_PATTERNS.match(str(dim)):
                 axis = i
                 break
-        data = var.values.astype(float)
+        raw = var.values
+        if np.issubdtype(raw.dtype, np.datetime64):
+            # xarray decoded CF time to datetime64 (ns since 1970-01-01)
+            # convert to seconds since 2000-01-01 to match EOPF/TAI convention
+            _TAI2000_NS = np.datetime64("2000-01-01T00:00:00", "ns").astype(np.int64)
+            data = (raw.astype(np.int64) - _TAI2000_NS) / 1e9
+        else:
+            data = raw.astype(float)
         attrs = dict(var.attrs)
+        attrs["_detected_time_axis"] = axis  # propagate for caller
         ds.close()
         data = _apply_time_slice(data, axis, time_slice)
     return data, attrs
@@ -1231,41 +1326,75 @@ def _build_compare_layout() -> html.Div:
             dbc.Card([
                 dbc.CardBody([
                     dbc.Row([
-                        dbc.Col(html.Div([
-                            html.Span("File A", className="fw-semibold text-muted me-2",
-                                      style={"fontSize": "12px", "whiteSpace": "nowrap"}),
-                            dbc.Input(
-                                id="cmp-file-a-input", type="text",
-                                placeholder="Paste path to Zarr directory or NetCDF file...",
-                                debounce=True, size="sm",
-                                style={"fontSize": "12px", "flex": "1"},
-                            ),
-                            dbc.Button("Load", id="cmp-file-a-btn", color="primary",
-                                       size="sm", style={"marginLeft": "6px"}),
-                        ], style={"display": "flex", "alignItems": "center"}), width=6, class_name="pe-2"),
-                        dbc.Col(html.Div([
-                            html.Span("File B", className="fw-semibold text-muted me-2",
-                                      style={"fontSize": "12px", "whiteSpace": "nowrap"}),
-                            dbc.Input(
-                                id="cmp-file-b-input", type="text",
-                                placeholder="Paste path to Zarr directory or NetCDF file...",
-                                debounce=True, size="sm",
-                                style={"fontSize": "12px", "flex": "1"},
-                            ),
-                            dbc.Button("Load", id="cmp-file-b-btn", color="primary",
-                                       size="sm", style={"marginLeft": "6px"}),
-                        ], style={"display": "flex", "alignItems": "center"}), width=6, class_name="ps-2"),
-                    ], class_name="g-0 mb-1"),
-                    dbc.Row([
-                        dbc.Col(html.Div(id="cmp-file-a-status",
-                                         className="text-muted",
-                                         style={"fontFamily": "monospace", "fontSize": "11px",
-                                                "paddingLeft": "46px"}), width=6),
-                        dbc.Col(html.Div(id="cmp-file-b-status",
-                                         className="text-muted",
-                                         style={"fontFamily": "monospace", "fontSize": "11px",
-                                                "paddingLeft": "46px"}), width=6),
-                    ]),
+                        dbc.Col([
+                            html.Div([
+                                dbc.Button("Open file", id="cmp-open-a-btn", color="secondary",
+                                           size="sm", outline=True),
+                                html.Span("File A", className="fw-semibold text-muted mx-2",
+                                          style={"fontSize": "12px", "whiteSpace": "nowrap"}),
+                                dcc.Dropdown(
+                                    id="cmp-file-a-select",
+                                    options=[],
+                                    value=None,
+                                    clearable=True,
+                                    placeholder="No file selected",
+                                    style={"flex": "1", "minWidth": "200px", "fontSize": "12px"},
+                                ),
+                                dbc.Button(
+                                    "ⓘ", id="cmp-info-a-btn", color="link", size="sm",
+                                    style={"fontSize": "14px", "padding": "2px 4px", "color": "#888",
+                                           "textDecoration": "none"},
+                                ),
+                                dbc.Tooltip(id="cmp-info-a-tooltip", target="cmp-info-a-btn",
+                                            placement="bottom"),
+                            ], style={"display": "flex", "alignItems": "center", "gap": "0px"}),
+                            html.Div([
+                                dcc.Input(id="cmp-path-a-input", type="text",
+                                          placeholder="Paste path to .zarr or NetCDF file…",
+                                          debounce=False,
+                                          style={"flex": "1", "fontSize": "12px", "height": "31px",
+                                                 "padding": "4px 8px", "border": "1px solid #ced4da",
+                                                 "borderRadius": "4px"}),
+                                dbc.Button("Load", id="cmp-path-a-go-btn", color="primary", size="sm",
+                                           style={"marginLeft": "4px"}),
+                            ], id="cmp-path-a-row",
+                               style={"display": "none", "alignItems": "center", "marginTop": "4px"}),
+                        ], width=6, class_name="pe-2"),
+                        dbc.Col([
+                            html.Div([
+                                dbc.Button("Open file", id="cmp-open-b-btn", color="secondary",
+                                           size="sm", outline=True),
+                                html.Span("File B", className="fw-semibold text-muted mx-2",
+                                          style={"fontSize": "12px", "whiteSpace": "nowrap"}),
+                                dcc.Dropdown(
+                                    id="cmp-file-b-select",
+                                    options=[],
+                                    value=None,
+                                    clearable=True,
+                                    placeholder="No file selected",
+                                    style={"flex": "1", "minWidth": "200px", "fontSize": "12px"},
+                                ),
+                                dbc.Button(
+                                    "ⓘ", id="cmp-info-b-btn", color="link", size="sm",
+                                    style={"fontSize": "14px", "padding": "2px 4px", "color": "#888",
+                                           "textDecoration": "none"},
+                                ),
+                                dbc.Tooltip(id="cmp-info-b-tooltip", target="cmp-info-b-btn",
+                                            placement="bottom"),
+                            ], style={"display": "flex", "alignItems": "center", "gap": "0px"}),
+                            html.Div([
+                                dcc.Input(id="cmp-path-b-input", type="text",
+                                          placeholder="Paste path to .zarr or NetCDF file…",
+                                          debounce=False,
+                                          style={"flex": "1", "fontSize": "12px", "height": "31px",
+                                                 "padding": "4px 8px", "border": "1px solid #ced4da",
+                                                 "borderRadius": "4px"}),
+                                dbc.Button("Load", id="cmp-path-b-go-btn", color="primary", size="sm",
+                                           style={"marginLeft": "4px"}),
+                            ], id="cmp-path-b-row",
+                               style={"display": "none", "alignItems": "center", "marginTop": "4px"}),
+                        ], width=6, class_name="ps-2"),
+                    ], class_name="g-0"),
                 ], class_name="py-2 px-3"),
             ], class_name="border-0 shadow-sm mb-2 mt-2"),
 
@@ -1316,6 +1445,20 @@ def _build_compare_layout() -> html.Div:
                     ], style={"display": "flex", "alignItems": "center", "gap": "4px", "marginLeft": "8px"}),
                     html.Span(id="cmp-run-status", className="text-muted small ms-3",
                               style={"fontSize": "11px"}),
+                    html.Span("│", style={"color": "#dee2e6", "margin": "0 8px"}),
+                    dbc.Button("Export mapping", id="cmp-export-mapping-btn",
+                               color="link", size="sm",
+                               style={"fontSize": "11px", "padding": "0"}),
+                    dcc.Upload(
+                        id="cmp-import-mapping-upload",
+                        children=dbc.Button("Import mapping", color="link", size="sm",
+                                            style={"fontSize": "11px", "padding": "0",
+                                                   "marginLeft": "8px"}),
+                        accept=".json",
+                        multiple=False,
+                    ),
+                    html.Span(id="cmp-import-status", className="text-muted",
+                              style={"fontSize": "10px", "marginLeft": "6px"}),
                     dbc.Button("Download HTML Report", id="cmp-report-btn",
                                color="link", size="sm",
                                style={"fontSize": "11px", "padding": "0", "marginLeft": "auto"}),
@@ -1401,6 +1544,7 @@ def make_layout(initial_path: str | None = None) -> html.Div:
         dcc.Store(id="cmp-mapping", data=[]),
         dcc.Store(id="cmp-results", data=[]),
         dcc.Download(id="cmp-download-report"),
+        dcc.Download(id="cmp-download-mapping"),
         dcc.Store(id="app-mode", data="explore"),
 
         # ---- Navbar --------------------------------------------------------
@@ -1429,31 +1573,38 @@ def make_layout(initial_path: str | None = None) -> html.Div:
 
         # File bar
         dbc.Container(html.Div([
-            dbc.Button("Open file", id="open-btn", color="secondary", size="sm", outline=True),
             html.Div([
-                dbc.Input(
+                dbc.Button("Open file", id="open-btn", color="secondary", size="sm", outline=True),
+                dcc.Dropdown(
+                    id="file-select",
+                    options=file_opts,
+                    value=active_file_init or None,
+                    clearable=True,
+                    placeholder="No file open",
+                    style={"flex": "1", "minWidth": "200px", "fontSize": "12px"},
+                ),
+                dbc.Button(
+                    "ⓘ", id="file-info-btn", color="link", size="sm",
+                    style={"fontSize": "14px", "padding": "2px 4px", "color": "#888",
+                           "textDecoration": "none"},
+                ),
+                dbc.Tooltip(id="file-info-tooltip", target="file-info-btn", placement="bottom"),
+            ], style={"display": "flex", "alignItems": "center", "gap": "8px"}),
+            html.Div([
+                dcc.Input(
                     id="path-input",
                     type="text",
                     placeholder="Paste path to .zarr directory or NetCDF file...",
-                    size="sm",
-                    style={"width": "400px", "fontSize": "12px"},
-                    debounce=True,
+                    debounce=False,
+                    style={"flex": "1", "fontSize": "12px", "height": "31px",
+                           "padding": "4px 8px", "border": "1px solid #ced4da",
+                           "borderRadius": "4px"},
                 ),
-                dbc.Button("Go", id="path-go-btn", color="primary", size="sm",
+                dbc.Button("Load", id="path-go-btn", color="primary", size="sm",
                            style={"marginLeft": "4px"}),
-            ], id="path-input-row", style={"display": "none", "alignItems": "center"}),
-            dcc.Dropdown(
-                id="file-select",
-                options=file_opts,
-                value=active_file_init or None,
-                clearable=False,
-                placeholder="No file open",
-                style={"width": "460px", "fontSize": "12px"},
-            ),
-            dbc.Button("Close", id="close-file-btn", color="danger", outline=True, size="sm"),
+            ], id="path-input-row", style={"display": "none", "alignItems": "center", "marginTop": "4px"}),
             html.Div(id="open-error", className="text-danger small"),
-        ], style={"display": "flex", "alignItems": "center", "gap": "8px",
-                  "padding": "8px 0", "flexWrap": "wrap"}),
+        ], style={"display": "flex", "flexDirection": "column", "padding": "8px 0", "maxWidth": "50%"}),
         fluid=True, class_name="border-bottom mb-2 pb-1"),
 
         dbc.Container(
@@ -2038,9 +2189,82 @@ app.index_string = app.index_string.replace(
 #cmp-unified-table td[data-dash-column="status"] .dash-cell-value::after {
     content: "▾"; color: #adb5bd; font-size: 10px; position: absolute; right: -14px; top: 0;
 }
+/* Allow dropdown menus in the compare table to escape the card overflow container */
+#cmp-mapping-area { overflow: visible !important; }
+#cmp-mapping-area .dash-table-container { overflow: visible !important; }
+#cmp-mapping-area .dash-spreadsheet-container { overflow: auto; max-height: 420px; }
+/* Wider tooltips for file info */
+.tooltip-inner { max-width: 500px !important; }
 </style></head>""",
 )
 app.layout = make_layout(sys.argv[1] if len(sys.argv) > 1 else None)
+
+
+# ---------------------------------------------------------------------------
+# Native folder picker (tkinter subprocess)
+# ---------------------------------------------------------------------------
+
+def _open_folder_dialog() -> str | None:
+    """Open a native file/folder picker. Returns selected path, '' if cancelled, None if failed."""
+    import subprocess as _sp
+    import platform as _platform
+
+    initialdir = os.path.dirname(os.path.abspath(sys.argv[0]))
+
+    if _platform.system() == "Darwin":
+        # osascript choose file or folder handles both NetCDF files and Zarr directories
+        safe_dir = initialdir.replace('"', '\\"')
+        script = (
+            f'set defaultDir to POSIX file "{safe_dir}"\n'
+            "try\n"
+            "    set chosen to choose file or folder with prompt "
+            '"Select a Zarr directory or NetCDF file" default location defaultDir\n'
+            "    POSIX path of chosen\n"
+            "on error\n"
+            '    ""\n'
+            "end try"
+        )
+        try:
+            result = _sp.run(["osascript", "-e", script], capture_output=True, text=True, timeout=30)
+            path = result.stdout.strip()
+            if path:
+                return path
+            if result.returncode != 0:
+                return None  # osascript failed
+            return ""  # user cancelled
+        except Exception:
+            return None
+
+    # Non-macOS: file dialog first (NetCDF), then directory dialog (Zarr) if cancelled
+    _picker_script = (
+        "import tkinter as tk\n"
+        "from tkinter import filedialog\n"
+        "root = tk.Tk()\n"
+        "root.withdraw()\n"
+        "root.call('wm', 'attributes', '.', '-topmost', True)\n"
+        "root.lift()\n"
+        "root.focus_force()\n"
+        f"initialdir = {repr(initialdir)}\n"
+        "path = filedialog.askopenfilename(\n"
+        "    title='Select NetCDF file', initialdir=initialdir,\n"
+        "    filetypes=[('NetCDF / HDF5', '*.nc *.h5 *.hdf5 *.he5 *.nc4'), ('All files', '*')])\n"
+        "if not path:\n"
+        "    path = filedialog.askdirectory(title='Select Zarr directory', initialdir=initialdir)\n"
+        "print(path or '')\n"
+    )
+    try:
+        result = _sp.run(
+            [sys.executable, "-c", _picker_script],
+            capture_output=True, text=True, timeout=30,
+        )
+        path = result.stdout.strip()
+        if path:
+            return path
+        if result.returncode != 0 or result.stderr.strip():
+            return None
+        return ""
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -2055,95 +2279,146 @@ app.layout = make_layout(sys.argv[1] if len(sys.argv) > 1 else None)
     Output("open-error", "children"),
     Output("file-select", "options"),
     Output("file-select", "value"),
+    Output("cmp-file-a-select", "options"),
+    Output("cmp-file-a-select", "value"),
+    Output("cmp-file-b-select", "options"),
+    Output("cmp-file-b-select", "value"),
     Output("path-input-row", "style"),
     Output("path-input", "value"),
+    Output("cmp-path-a-row", "style"),
+    Output("cmp-path-b-row", "style"),
+    Output("cmp-path-a-input", "value"),
+    Output("cmp-path-b-input", "value"),
     Input("open-btn", "n_clicks"),
     Input("file-select", "value"),
-    Input("close-file-btn", "n_clicks"),
     Input("path-go-btn", "n_clicks"),
-    Input("path-input", "value"),
+    Input("cmp-open-a-btn", "n_clicks"),
+    Input("cmp-open-b-btn", "n_clicks"),
+    Input("cmp-path-a-go-btn", "n_clicks"),
+    Input("cmp-path-b-go-btn", "n_clicks"),
+    State("path-input", "value"),
+    State("cmp-path-a-input", "value"),
+    State("cmp-path-b-input", "value"),
     State("open-files", "data"),
     State("active-file", "data"),
+    State("cmp-file-a-select", "value"),
+    State("cmp-file-b-select", "value"),
     prevent_initial_call=True,
 )
-def manage_files(_open, _switch, _close, _go, path_input_val, open_files, active_file):
+def manage_files(_open, _switch, _go,
+                 _cmp_open_a, _cmp_open_b, _cmp_go_a, _cmp_go_b,
+                 path_input_val, path_cmp_a, path_cmp_b,
+                 open_files, active_file, cmp_a_val, cmp_b_val):
     triggered = ctx.triggered_id
     no = dash.no_update
     _path_hidden = {"display": "none"}
-    _path_shown = {"display": "flex", "alignItems": "center"}
+    _path_shown = {"display": "flex", "alignItems": "center", "marginTop": "4px"}
+    _cmp_row_hidden = {"display": "none"}
+    _cmp_row_shown = {"display": "flex", "alignItems": "center", "marginTop": "4px"}
+    # 15 outputs: open-files, active-file, open-error,
+    #   file-select opts, file-select value,
+    #   cmp-a-select opts, cmp-a-select value,
+    #   cmp-b-select opts, cmp-b-select value,
+    #   path-input-row style, path-input value,
+    #   cmp-path-a-row style, cmp-path-b-row style, cmp-path-a-input value, cmp-path-b-input value
 
-    def _open_path(path):
-        """Try to open a zarr path, return the full tuple."""
+    def _opts(files):
+        return [{"label": f["label"], "value": f["id"]} for f in (files or [])]
+
+    def _do_open(path: str):
+        """Add file to open_files list. Returns (new_files, error_str | None)."""
         if not path:
-            return no, no, "", no, no, no, no
+            return None, "No path provided"
         if path in [f["id"] for f in open_files]:
-            opts = [{"label": f["label"], "value": f["id"]} for f in open_files]
-            return open_files, path, "", opts, path, _path_hidden, ""
+            return open_files, None  # already open
         try:
-            open_zarr_file(path)
+            fmt = _detect_format(path)
+            if fmt == "zarr":
+                open_zarr_file(path)  # cache in stores; not needed for NetCDF
             label = os.path.basename(path.rstrip("/\\"))
-            size_mb = _get_dir_size_mb(path)
-            label_with_size = f"{label}  ({size_mb:.1f} MB)"
-            new_files = open_files + [{"id": path, "label": label_with_size}]
-            opts = [{"label": f["label"], "value": f["id"]} for f in new_files]
-            return new_files, path, "", opts, path, _path_hidden, ""
+            size_mb = _get_dir_size_mb(path) if os.path.isdir(path) else os.path.getsize(path) / (1024 * 1024)
+            new_files = open_files + [{"id": path, "label": f"{label}  ({size_mb:.1f} MB)"}]
+            return new_files, None
         except Exception as e:
-            return no, no, f"Failed to open: {e}", no, no, no, no
+            return None, str(e)
 
     if triggered == "open-btn":
-        import subprocess as _sp
+        picked = _open_folder_dialog()
+        if picked:
+            new_files, err = _do_open(picked)
+            if err:
+                return no, no, f"Failed to open: {err}", no, no, no, no, no, no, no, no, no, no, no, no
+            opts = _opts(new_files)
+            return new_files, picked, "", opts, picked, opts, no, opts, no, _path_hidden, "", no, no, no, no
+        # dialog failed or cancelled → show path input fallback
+        return no, no, "", no, no, no, no, no, no, _path_shown, "", no, no, no, no
 
-        _picker_script = (
-            "import tkinter as tk\n"
-            "from tkinter import filedialog\n"
-            "import platform, os, subprocess\n"
-            "root = tk.Tk()\n"
-            "root.withdraw()\n"
-            "root.call('wm', 'attributes', '.', '-topmost', True)\n"
-            "root.lift()\n"
-            "root.focus_force()\n"
-            "if platform.system() == 'Darwin':\n"
-            "    pid = os.getpid()\n"
-            "    subprocess.run(['osascript', '-e',\n"
-            "        f'tell app \"System Events\" to set frontmost of first process "
-            "whose unix id is {pid} to true'],\n"
-            "        capture_output=True)\n"
-            "path = filedialog.askdirectory(title='Select .zarr directory')\n"
-            "print(path)\n"
-        )
-        result = _sp.run(
-            [sys.executable, "-c", _picker_script],
-            capture_output=True, text=True, timeout=30,
-        )
-        path = result.stdout.strip()
-        if path:
-            return _open_path(path)
-        # tkinter returned empty — could be cancelled or failed; show fallback input
-        if result.returncode != 0 or result.stderr.strip():
-            # tkinter failed (no display, missing tk, etc.) — show path input
-            return no, no, "", no, no, _path_shown, ""
-        # User cancelled the dialog
-        return no, no, "", no, no, no, no
-
-    if triggered == "path-go-btn" or triggered == "path-input":
+    if triggered == "path-go-btn":
         path = (path_input_val or "").strip()
         if not path:
-            return no, no, "", no, no, no, no
-        return _open_path(path)
+            return no, no, "", no, no, no, no, no, no, no, no, no, no, no, no
+        new_files, err = _do_open(path)
+        if err:
+            return no, no, f"Failed to open: {err}", no, no, no, no, no, no, no, no, no, no, no, no
+        opts = _opts(new_files)
+        return new_files, path, "", opts, path, opts, no, opts, no, _path_hidden, "", no, no, no, no
 
     if triggered == "file-select":
-        return no, _switch, "", no, no, no, no
+        if _switch is None:  # user cleared the dropdown → close active file
+            if not active_file:
+                return no, no, "", no, no, no, no, no, no, no, no, no, no, no, no
+            close_zarr_file(active_file)
+            new_files = [f for f in open_files if f["id"] != active_file]
+            new_active = new_files[-1]["id"] if new_files else None
+            opts = _opts(new_files)
+            new_cmp_a = None if cmp_a_val == active_file else no
+            new_cmp_b = None if cmp_b_val == active_file else no
+            return new_files, new_active or "", "", opts, new_active, opts, new_cmp_a, opts, new_cmp_b, no, no, no, no, no, no
+        return no, _switch, "", no, no, no, no, no, no, no, no, no, no, no, no
 
-    if triggered == "close-file-btn":
-        if not active_file:
-            return no, no, "", no, no, no, no
-        close_zarr_file(active_file)
-        new_files = [f for f in open_files if f["id"] != active_file]
-        opts = [{"label": f["label"], "value": f["id"]} for f in new_files]
-        new_active = new_files[-1]["id"] if new_files else None
-        return new_files, new_active or "", "", opts, new_active, no, no
+    if triggered == "cmp-open-a-btn":
+        picked = _open_folder_dialog()
+        if picked:
+            new_files, err = _do_open(picked)
+            if err:
+                return no, no, f"Failed to open: {err}", no, no, no, no, no, no, no, no, no, no, no, no
+            opts = _opts(new_files)
+            return new_files, no, "", opts, no, opts, picked, opts, no, no, no, _cmp_row_hidden, no, "", no
+        # dialog failed or cancelled → show inline path input
+        return no, no, "", no, no, no, no, no, no, no, no, _cmp_row_shown, no, no, no
 
-    return no, no, "", no, no, no, no
+    if triggered == "cmp-open-b-btn":
+        picked = _open_folder_dialog()
+        if picked:
+            new_files, err = _do_open(picked)
+            if err:
+                return no, no, f"Failed to open: {err}", no, no, no, no, no, no, no, no, no, no, no, no
+            opts = _opts(new_files)
+            return new_files, no, "", opts, no, opts, no, opts, picked, no, no, no, _cmp_row_hidden, no, ""
+        # dialog failed or cancelled → show inline path input
+        return no, no, "", no, no, no, no, no, no, no, no, no, _cmp_row_shown, no, no
+
+    if triggered == "cmp-path-a-go-btn":
+        path = (path_cmp_a or "").strip()
+        if not path:
+            return no, no, "", no, no, no, no, no, no, no, no, no, no, no, no
+        new_files, err = _do_open(path)
+        if err:
+            return no, no, f"Failed to open: {err}", no, no, no, no, no, no, no, no, no, no, no, no
+        opts = _opts(new_files)
+        return new_files, no, "", opts, no, opts, path, opts, no, no, no, _cmp_row_hidden, no, "", no
+
+    if triggered == "cmp-path-b-go-btn":
+        path = (path_cmp_b or "").strip()
+        if not path:
+            return no, no, "", no, no, no, no, no, no, no, no, no, no, no, no
+        new_files, err = _do_open(path)
+        if err:
+            return no, no, f"Failed to open: {err}", no, no, no, no, no, no, no, no, no, no, no, no
+        opts = _opts(new_files)
+        return new_files, no, "", opts, no, opts, no, opts, path, no, no, no, _cmp_row_hidden, no, ""
+
+    return no, no, "", no, no, no, no, no, no, no, no, no
 
 
 # ---- Tree rendering with search ----
@@ -2202,7 +2477,8 @@ def render_tree(active_file, search_text):
         ),
     ], style={"borderBottom": "2px solid #593196"})
 
-    root_children = html.Div(children, id="root-tree-children")
+    root_meta = _build_metadata_node(root_attrs, 0, search_text or "", "__root__")
+    root_children = html.Div(children + root_meta, id="root-tree-children")
 
     tree = [root_header, root_children]
     return tree, opts, opts
@@ -2453,7 +2729,20 @@ def show_attrs(var_path, _group_clicks, active_file):
     if attrs:
         lines.append("\n--- attributes ---")
         for k, v in attrs.items():
-            lines.append(f"{k}: {v}")
+            if isinstance(v, dict):
+                lines.append(f"{k}:")
+                for sk, sv in v.items():
+                    # EOPF scalar variable pattern: {data: <value>, dtype: ..., attrs: {units: ...}, dims: []}
+                    if isinstance(sv, dict) and "data" in sv and sv.get("dims") == []:
+                        data_val = sv["data"]
+                        dtype = sv.get("dtype", "")
+                        units = sv.get("attrs", {}).get("units", "")
+                        suffix = "  [" + ", ".join(x for x in [dtype, units] if x) + "]" if (dtype or units) else ""
+                        lines.append(f"  {sk}: {data_val}{suffix}")
+                    else:
+                        lines.append(f"  {sk}: {sv}")
+            else:
+                lines.append(f"{k}: {v}")
     else:
         lines.append("\n(no attributes)")
 
@@ -3046,25 +3335,76 @@ def _file_load_callback(path: str) -> tuple[str, list, str]:
 @app.callback(
     Output("cmp-file-a-path", "data"),
     Output("cmp-file-a-vars", "data"),
-    Output("cmp-file-a-status", "children"),
-    Input("cmp-file-a-btn", "n_clicks"),
-    Input("cmp-file-a-input", "value"),
+    Input("cmp-file-a-select", "value"),
     prevent_initial_call=True,
 )
-def load_file_a(_n, path):
-    return _file_load_callback(path)
+def update_cmp_file_a(path):
+    if not path:
+        return "", []
+    try:
+        return path, _get_file_vars(path)
+    except Exception:
+        return "", []
 
 
 @app.callback(
     Output("cmp-file-b-path", "data"),
     Output("cmp-file-b-vars", "data"),
-    Output("cmp-file-b-status", "children"),
-    Input("cmp-file-b-btn", "n_clicks"),
-    Input("cmp-file-b-input", "value"),
+    Input("cmp-file-b-select", "value"),
     prevent_initial_call=True,
 )
-def load_file_b(_n, path):
-    return _file_load_callback(path)
+def update_cmp_file_b(path):
+    if not path:
+        return "", []
+    try:
+        return path, _get_file_vars(path)
+    except Exception:
+        return "", []
+
+
+@app.callback(
+    Output("file-info-tooltip", "children"),
+    Input("active-file", "data"),
+)
+def update_file_info_tooltip(path):
+    if not path:
+        return "No file open"
+    try:
+        fmt = "Zarr" if _detect_format(path) == "zarr" else "NetCDF"
+        size_mb = _get_dir_size_mb(path) if os.path.isdir(path) else os.path.getsize(path) / (1024 * 1024)
+        return f"Type: {fmt}  ·  {size_mb:.1f} MB\n{path}"
+    except Exception:
+        return path
+
+
+@app.callback(
+    Output("cmp-info-a-tooltip", "children"),
+    Input("cmp-file-a-select", "value"),
+)
+def update_cmp_info_a(path):
+    if not path:
+        return "No file selected"
+    try:
+        fmt = "Zarr" if _detect_format(path) == "zarr" else "NetCDF"
+        size_mb = _get_dir_size_mb(path) if os.path.isdir(path) else os.path.getsize(path) / (1024 * 1024)
+        return f"Type: {fmt}  ·  {size_mb:.1f} MB\n{path}"
+    except Exception:
+        return path or "No file selected"
+
+
+@app.callback(
+    Output("cmp-info-b-tooltip", "children"),
+    Input("cmp-file-b-select", "value"),
+)
+def update_cmp_info_b(path):
+    if not path:
+        return "No file selected"
+    try:
+        fmt = "Zarr" if _detect_format(path) == "zarr" else "NetCDF"
+        size_mb = _get_dir_size_mb(path) if os.path.isdir(path) else os.path.getsize(path) / (1024 * 1024)
+        return f"Type: {fmt}  ·  {size_mb:.1f} MB\n{path}"
+    except Exception:
+        return path or "No file selected"
 
 
 @app.callback(
@@ -3240,8 +3580,7 @@ def render_unified_table(mapping, results, filt, vars_b):
                 {"label": "skipped", "value": "skipped"},
             ]},
         },
-        style_table={"overflowX": "auto", "overflowY": "auto",
-                     "maxHeight": "420px", "fontSize": "12px"},
+        style_table={"overflowX": "auto", "fontSize": "12px"},
         style_cell={"fontFamily": "monospace", "fontSize": "11px",
                     "padding": "4px 8px", "textAlign": "left", "minWidth": "60px"},
         style_cell_conditional=[
@@ -3299,7 +3638,6 @@ def render_unified_table(mapping, results, filt, vars_b):
         ),
         page_action="none",
         sort_action="native",
-        fixed_rows={"headers": True},
     )
 
 
@@ -3572,6 +3910,59 @@ def download_report(_n, results, mapping, file_a, file_b):
     parts.append("</body></html>")
     filename = f"comparison_{label_a}_vs_{label_b}_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.html"
     return dcc.send_string("".join(parts), filename)
+
+
+# ---- Mapping export ----
+
+@app.callback(
+    Output("cmp-download-mapping", "data"),
+    Input("cmp-export-mapping-btn", "n_clicks"),
+    State("cmp-mapping", "data"),
+    prevent_initial_call=True,
+)
+def export_mapping(_n, mapping):
+    if not mapping:
+        return dash.no_update
+    import json as _json
+    payload = {"version": "1", "mapping": mapping}
+    filename = f"variable_mapping_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+    return dcc.send_string(_json.dumps(payload, indent=2), filename)
+
+
+# ---- Mapping import ----
+
+@app.callback(
+    Output("cmp-mapping", "data", allow_duplicate=True),
+    Output("cmp-import-status", "children"),
+    Input("cmp-import-mapping-upload", "contents"),
+    State("cmp-file-a-vars", "data"),
+    State("cmp-file-b-vars", "data"),
+    prevent_initial_call=True,
+)
+def import_mapping(contents, vars_a, vars_b):
+    if not contents:
+        return dash.no_update, ""
+    import json as _json
+    import base64 as _b64
+    try:
+        _header, _data = contents.split(",", 1)
+        payload = _json.loads(_b64.b64decode(_data).decode("utf-8"))
+        mapping = payload.get("mapping") if isinstance(payload, dict) else payload
+        if not isinstance(mapping, list):
+            return dash.no_update, "Invalid file."
+    except Exception as exc:
+        return dash.no_update, f"Error: {exc}"
+
+    # Warn about unmatched paths
+    a_paths = {v["path"] for v in (vars_a or [])}
+    b_paths = {v["path"] for v in (vars_b or [])}
+    missing = sum(
+        1 for r in mapping
+        if (r.get("path_a") and r["path_a"] not in a_paths)
+        or (r.get("path_b") and r["path_b"] not in b_paths)
+    )
+    status = f"Loaded {len(mapping)} rows." + (f" {missing} paths not found in current files." if missing else "")
+    return mapping, status
 
 
 # ---------------------------------------------------------------------------
