@@ -20,7 +20,7 @@ import re
 import sys
 import threading
 import warnings
-import webbrowser  # noqa: F401
+import webbrowser
 
 import dash
 import dash_bootstrap_components as dbc
@@ -109,58 +109,6 @@ def _get_dir_size_mb(path: str) -> float:
 # ---------------------------------------------------------------------------
 # Tree builder
 # ---------------------------------------------------------------------------
-
-def _build_metadata_node(node_attrs: dict, depth: int, search_filter: str, group_path: str) -> list:
-    """Build a virtual [metadata] collapsible node from EOPF other_metadata scalars."""
-    other_metadata = node_attrs.get("other_metadata", {})
-    if not isinstance(other_metadata, dict):
-        return []
-    sf = search_filter.lower().strip() if search_filter else ""
-    meta_items = []
-    for key, val in other_metadata.items():
-        if not (isinstance(val, dict) and "data" in val and val.get("dims") == []):
-            continue
-        if sf and sf not in key.lower():
-            continue
-        data_val = val["data"]
-        dtype = val.get("dtype", "")
-        units = val.get("attrs", {}).get("units", "")
-        suffix = "  [" + ", ".join(x for x in [dtype, units] if x) + "]" if (dtype or units) else ""
-        meta_items.append(
-            html.Div(
-                html.Span(
-                    f"{key}: {data_val}{suffix}",
-                    style={"fontSize": "11px", "fontFamily": "monospace",
-                           "color": "#6c757d", "padding": "2px 6px", "display": "block"},
-                ),
-                style={"paddingLeft": f"{(depth + 1) * 14}px", "borderBottom": "1px solid #dee2e6"},
-            )
-        )
-    if not meta_items:
-        return []
-    meta_id = f"__meta__{group_path}"
-    return [html.Div([
-        dbc.Button(
-            [
-                html.Span("\u25BE ", id={"type": "group-arrow", "index": meta_id},
-                          style={"fontSize": "10px", "display": "inline-block",
-                                 "transition": "transform 0.15s"}),
-                "[metadata]",
-            ],
-            id={"type": "group-toggle", "index": meta_id},
-            color="link", size="sm", class_name="text-start w-100",
-            style={
-                "fontSize": "11px", "fontFamily": "monospace", "fontStyle": "italic",
-                "color": "#6c757d",
-                "padding": f"3px 6px 3px {depth * 14 + 6}px",
-                "background": "#f8f9fa",
-                "borderBottom": "1px solid #dee2e6",
-                "borderRadius": "0",
-            },
-        ),
-        dbc.Collapse(meta_items, id={"type": "group-collapse", "index": meta_id}, is_open=True),
-    ])]
-
 
 def build_tree(node: zarr.Group | zarr.Array, path: str = "", depth: int = 0,
                search_filter: str = "") -> list:
@@ -332,6 +280,12 @@ def find_dim_coords(store: zarr.Group, var_path: str) -> dict[str, str]:
     return coords
 
 
+def _int_or_none(s: str) -> int | None:
+    """Convert a string to int, returning None for empty/whitespace-only strings."""
+    s = s.strip()
+    return int(s) if s else None
+
+
 def _parse_slice_text(text: str | None, ndim: int) -> tuple:
     """Parse numpy-style slice string into an index tuple.
 
@@ -349,11 +303,6 @@ def _parse_slice_text(text: str | None, ndim: int) -> tuple:
             index.append(slice(None))
         elif ":" in token:
             parts = token.split(":")
-
-            def _int_or_none(s: str):
-                s = s.strip()
-                return int(s) if s else None
-
             start = _int_or_none(parts[0])
             stop = _int_or_none(parts[1]) if len(parts) > 1 else None
             step = _int_or_none(parts[2]) if len(parts) > 2 else None
@@ -899,6 +848,7 @@ def _get_file_vars(path: str) -> list[dict]:
                     "name": name,
                     "shape": str(tuple(var.shape)),
                     "dtype": str(var.dtype),
+                    "logical_dtype": "",
                     "units": attrs.get("units", ""),
                     "long_name": attrs.get("long_name", attrs.get("standard_name", "")),
                     "scale_factor": attrs.get("scale_factor", None),
@@ -1018,6 +968,7 @@ def _auto_match(vars_a: list[dict], vars_b: list[dict]) -> list[dict]:
                 "path_a": "", "name_a": "", "shape_a": "",
                 "path_b": b["path"], "name_b": b["name"], "shape_b": b["shape"],
                 "confidence": "none", "status": "pending",
+                "tolerance": _auto_detect_tolerance(b),
             })
 
     return rows
@@ -1028,21 +979,22 @@ _TIME_DIM_PATTERNS = re.compile(
 )
 
 
-def _parse_slice(s: str) -> slice | None:
+def _parse_slice(s: str, warn: bool = False) -> slice | None:
     """Parse a slice string like '0:800', '::2', '100:' into a slice object. Returns None if empty."""
     if not s or not s.strip():
         return None
     parts = s.strip().split(":")
     if len(parts) < 2 or len(parts) > 3:
+        if warn:
+            print(f"Warning: ignoring malformed slice '{s}' (expected format: start:stop or start:stop:step)", file=sys.stderr)
         return None
-    def _int_or_none(v: str) -> int | None:
-        v = v.strip()
-        return int(v) if v else None
     try:
         if len(parts) == 2:
             return slice(_int_or_none(parts[0]), _int_or_none(parts[1]))
         return slice(_int_or_none(parts[0]), _int_or_none(parts[1]), _int_or_none(parts[2]))
     except ValueError:
+        if warn:
+            print(f"Warning: ignoring malformed slice '{s}' (non-integer values)", file=sys.stderr)
         return None
 
 
@@ -1094,7 +1046,10 @@ def _load_var_data(file_path: str, var_path: str, apply_scale: bool = True,
         entry = other_meta.get(key, {})
         if not isinstance(entry, dict) or "data" not in entry:
             raise KeyError(f"other_metadata key not found: {key}")
-        data = np.array([float(entry["data"])])
+        try:
+            data = np.array([float(entry["data"])])
+        except (ValueError, TypeError):
+            raise TypeError(f"Cannot compare non-numeric metadata scalar: {var_path} (value={entry['data']!r})")
         meta_attrs = entry.get("attrs", {})
         meta_attrs["_detected_time_axis"] = None
         return data, meta_attrs
@@ -1102,7 +1057,10 @@ def _load_var_data(file_path: str, var_path: str, apply_scale: bool = True,
         s = zarr.open(file_path, mode="r")
         node = s[var_path]
         attrs = dict(node.attrs)
-        data = node[:].astype(float)
+        raw_data = node[:]
+        if not np.issubdtype(raw_data.dtype, np.number) and not np.issubdtype(raw_data.dtype, np.bool_):
+            raise TypeError(f"Cannot compare non-numeric array: {var_path} (dtype={raw_data.dtype})")
+        data = raw_data.astype(float)
         if apply_scale:
             fill_value = attrs.get("_FillValue", attrs.get("missing_value", None))
             if fill_value is not None:
@@ -1137,8 +1095,10 @@ def _load_var_data(file_path: str, var_path: str, apply_scale: bool = True,
             # convert to seconds since 2000-01-01 to match EOPF/TAI convention
             _TAI2000_NS = np.datetime64("2000-01-01T00:00:00", "ns").astype(np.int64)
             data = (raw.astype(np.int64) - _TAI2000_NS) / 1e9
-        else:
+        elif np.issubdtype(raw.dtype, np.number) or np.issubdtype(raw.dtype, np.bool_):
             data = raw.astype(float)
+        else:
+            raise TypeError(f"Cannot compare non-numeric array: {var_path} (dtype={raw.dtype})")
         attrs = dict(var.attrs)
         attrs["_detected_time_axis"] = axis  # propagate for caller
         ds.close()
@@ -1312,9 +1272,12 @@ def _make_compare_figures(
         pa = sq_a.reshape(-1, sq_a.shape[-1]).astype(float)
         pb = sq_b.reshape(-1, sq_b.shape[-1]).astype(float)
         if pa.size > _CMP_SIZE_CAP:
-            step = max(1, pa.shape[0] * pa.shape[1] // _CMP_SIZE_CAP)
-            pa = pa[::step, :]
-            pb = pb[::step, :]
+            step_a = max(1, pa.shape[0] * pa.shape[1] // _CMP_SIZE_CAP)
+            pa = pa[::step_a, :]
+            warning = "Data downsampled for display."
+        if pb.size > _CMP_SIZE_CAP:
+            step_b = max(1, pb.shape[0] * pb.shape[1] // _CMP_SIZE_CAP)
+            pb = pb[::step_b, :]
             warning = "Data downsampled for display."
         fig_overlay = make_subplots(rows=1, cols=2,
                                     subplot_titles=[label_a, label_b],
@@ -2274,7 +2237,13 @@ app.index_string = app.index_string.replace(
 #cmp-import-mapping-upload { display: inline-flex !important; align-items: center !important; line-height: 1 !important; }
 </style></head>""",
 )
-app.layout = make_layout(sys.argv[1] if len(sys.argv) > 1 else None)
+def _serve_layout():
+    """Deferred layout — avoids building the UI when running CLI subcommands."""
+    initial = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] not in ("explore", "compare") else None
+    return make_layout(initial)
+
+
+app.layout = _serve_layout
 
 
 # ---------------------------------------------------------------------------
@@ -3776,6 +3745,8 @@ def render_detail_panel(active_cell, log_scale, apply_scale, detail_mode, table_
              "padding": "8px 0 4px 0", "borderTop": "1px solid #dee2e6", "marginTop": "8px"}
     if not active_cell or not results or not table_data:
         return html.Div(), _hide
+    if active_cell["row"] >= len(table_data):
+        return html.Div(), _hide
     # Look up the clicked row's (path_a, path_b) and find in results
     clicked = table_data[active_cell["row"]]
     key = (clicked.get("path_a", ""), clicked.get("path_b", ""))
@@ -3971,10 +3942,20 @@ def _compute_unmatched(mapping: list, file_b_vars: list) -> tuple[list[str], lis
         if row.get("status") == "confirmed" and row.get("path_b"):
             confirmed_a.add(row["path_a"])
             confirmed_b.add(row["path_b"])
+    # "skipped" rows were explicitly excluded by the user — don't report them as unmatched
+    skipped_a: set[str] = set()
+    skipped_b: set[str] = set()
+    for row in (mapping or []):
+        if row.get("status") == "skipped":
+            if row.get("path_a"):
+                skipped_a.add(row["path_a"])
+            if row.get("path_b"):
+                skipped_b.add(row["path_b"])
     unmatched_a = [row["path_a"] for row in (mapping or [])
-                   if row.get("path_a") and row["path_a"] not in confirmed_a]
+                   if row.get("path_a") and row["path_a"] not in confirmed_a
+                   and row["path_a"] not in skipped_a]
     b_paths = {v["path"] for v in (file_b_vars or [])}
-    unmatched_b = sorted(b_paths - confirmed_b)
+    unmatched_b = sorted(b_paths - confirmed_b - skipped_b)
     return unmatched_a, unmatched_b
 
 
@@ -4089,7 +4070,7 @@ def _build_html_report(results: list, file_a: str, file_b: str,
                     parts.append(pio.to_html(fig, full_html=False, include_plotlyjs=include_js))
                     first_fig = False
         except Exception as exc:
-            parts.append(f"<p class='err'>Could not generate figures: {exc}</p>")
+            parts.append(f"<p class='err'>Could not generate figures: {_esc(str(exc))}</p>")
 
     parts.append("</body></html>")
     return "".join(parts)
@@ -4190,7 +4171,7 @@ def _cli_explore(args: "argparse.Namespace") -> None:
         if v.get("long_name"):
             print(f"long_name: {v['long_name']}")
         if args.values:
-            sl = _parse_slice(args.slice or "") if args.slice else None
+            sl = _parse_slice(args.slice or "", warn=True) if args.slice else None
             data, _ = _load_var_data(path, args.var, apply_scale=not args.raw, time_slice=sl)
             print(f"values:\n{data}")
     else:
@@ -4221,8 +4202,8 @@ def _cli_compare(args: "argparse.Namespace") -> None:
     mapping = payload.get("mapping") if isinstance(payload, dict) else payload
     slice_a_str = payload.get("slice_a", "") if isinstance(payload, dict) else ""
     slice_b_str = payload.get("slice_b", "") if isinstance(payload, dict) else ""
-    sl_a = _parse_slice(slice_a_str)
-    sl_b = _parse_slice(slice_b_str)
+    sl_a = _parse_slice(slice_a_str, warn=True)
+    sl_b = _parse_slice(slice_b_str, warn=True)
 
     confirmed = [r for r in mapping if r.get("status") == "confirmed" and r.get("path_b")]
     if not confirmed:
@@ -4287,7 +4268,7 @@ if __name__ == "__main__":
     p_explore.add_argument("path", help="Path to .zarr directory or NetCDF file")
     p_explore.add_argument("--var", metavar="VAR_PATH", help="Focus on a specific variable path")
     p_explore.add_argument("--values", action="store_true", help="Print array values (requires --var)")
-    p_explore.add_argument("--slice", metavar="SLICE", help="Slice to apply when printing values, e.g. '0:10' or '::4'")
+    p_explore.add_argument("--slice", metavar="SLICE", help="Slice to apply when printing values, e.g. '0:10' or '::4' (for negative indices use --slice=-3:)")
     p_explore.add_argument("--raw", action="store_true", help="Skip scaling (no scale_factor/add_offset/FillValue applied)")
 
     # ---- compare subcommand ----
