@@ -3,13 +3,15 @@
 """
 Zarr Explorer — Dash/Plotly viewer and comparator for Zarr and NetCDF files.
 
-Usage:
+Web UI:
     python zarr_explorer.py [path/to/file.zarr]
 
-Opens automatically in the browser at http://127.0.0.1:8050
+CLI:
+    python zarr_explorer.py explore <path> [--var VAR_PATH] [--values] [--slice SLICE]
+    python zarr_explorer.py compare <file_a> <file_b> --mapping mapping.json [--output report.html]
 """
 
-__version__ = "0.3"
+__version__ = "0.4"
 
 import datetime
 import difflib
@@ -156,7 +158,7 @@ def _build_metadata_node(node_attrs: dict, depth: int, search_filter: str, group
                 "borderRadius": "0",
             },
         ),
-        dbc.Collapse(meta_items, id={"type": "group-collapse", "index": meta_id}, is_open=False),
+        dbc.Collapse(meta_items, id={"type": "group-collapse", "index": meta_id}, is_open=True),
     ])]
 
 
@@ -206,8 +208,7 @@ def build_tree(node: zarr.Group | zarr.Array, path: str = "", depth: int = 0,
         else:
             # Recurse into group - if filtering, only show group if it has matching children
             child_items = build_tree(child, child_path, depth + 1, search_filter=sf)
-            child_meta = _build_metadata_node(dict(child.attrs), depth + 1, sf, child_path)
-            if sf and not child_items and not child_meta:
+            if sf and not child_items:
                 continue
             items.append(html.Div([
                 dbc.Button(
@@ -235,7 +236,7 @@ def build_tree(node: zarr.Group | zarr.Array, path: str = "", depth: int = 0,
                     },
                 ),
                 dbc.Collapse(
-                    child_items + child_meta,
+                    child_items,
                     id={"type": "group-collapse", "index": child_path},
                     is_open=True,  # always start open (user can collapse manually)
                 ),
@@ -854,11 +855,36 @@ def _get_file_vars(path: str) -> list[dict]:
                 "name": arr_info["value"].split("/")[-1],
                 "shape": str(node.shape),
                 "dtype": str(node.dtype),
-                "logical_dtype": attrs.get("dtype", eopf.get("dtype", "")),  # EOPF logical type e.g. 'byte', 'short'
+                "logical_dtype": attrs.get("dtype", eopf.get("dtype", "")),
                 "units": attrs.get("units", ""),
                 "long_name": attrs.get("long_name", attrs.get("standard_name", "")),
                 "scale_factor": attrs.get("scale_factor", eopf.get("scale_factor", None)),
             })
+        # Also collect other_metadata scalar fields from all groups
+        def _collect_meta_scalars(node: zarr.Group, grp_path: str = "") -> None:
+            if not isinstance(node, zarr.Group):
+                return
+            other_meta = dict(node.attrs).get("other_metadata", {})
+            if isinstance(other_meta, dict):
+                for key, val in other_meta.items():
+                    if isinstance(val, dict) and "data" in val and val.get("dims") == []:
+                        meta_path = f"{grp_path}/.meta/other_metadata/{key}" if grp_path else f".meta/other_metadata/{key}"
+                        meta_attrs = val.get("attrs", {})
+                        result.append({
+                            "path": meta_path,
+                            "name": key,
+                            "shape": "()",
+                            "dtype": val.get("dtype", ""),
+                            "logical_dtype": "",
+                            "units": meta_attrs.get("units", ""),
+                            "long_name": meta_attrs.get("long_name", ""),
+                            "scale_factor": None,
+                        })
+            for name, child in node.members():
+                child_path = f"{grp_path}/{name}" if grp_path else name
+                if isinstance(child, zarr.Group):
+                    _collect_meta_scalars(child, child_path)
+        _collect_meta_scalars(s)
         return result
     else:
         import netCDF4 as _nc4
@@ -1050,6 +1076,28 @@ def _load_var_data(file_path: str, var_path: str, apply_scale: bool = True,
     """Load a variable as a numpy array. CF decoding applied when apply_scale=True.
     time_slice is applied on the detected time axis before returning. Returns (data, attrs)."""
     fmt = _detect_format(file_path)
+    # Handle virtual other_metadata scalar paths: "group/.meta/other_metadata/key"
+    if "/.meta/" in var_path or var_path.startswith(".meta/"):
+        if fmt != "zarr":
+            raise ValueError("other_metadata scalars are only supported in Zarr files")
+        if var_path.startswith(".meta/"):
+            rest = var_path[len(".meta/"):]
+            grp_path = ""
+        else:
+            grp_path, rest = var_path.split("/.meta/", 1)
+        # rest is "other_metadata/key" or legacy "key"
+        rest_parts = rest.split("/", 1)
+        meta_source, key = (rest_parts[0], rest_parts[1]) if len(rest_parts) == 2 else ("other_metadata", rest_parts[0])
+        s = zarr.open(file_path, mode="r")
+        grp = s[grp_path] if grp_path else s
+        other_meta = dict(grp.attrs).get(meta_source, {})
+        entry = other_meta.get(key, {})
+        if not isinstance(entry, dict) or "data" not in entry:
+            raise KeyError(f"other_metadata key not found: {key}")
+        data = np.array([float(entry["data"])])
+        meta_attrs = entry.get("attrs", {})
+        meta_attrs["_detected_time_axis"] = None
+        return data, meta_attrs
     if fmt == "zarr":
         s = zarr.open(file_path, mode="r")
         node = s[var_path]
@@ -1357,6 +1405,10 @@ def _build_compare_layout() -> html.Div:
                                                  "borderRadius": "4px"}),
                                 dbc.Button("Load", id="cmp-path-a-go-btn", color="primary", size="sm",
                                            style={"marginLeft": "4px"}),
+                                dbc.Button("×", id="cmp-path-a-dismiss-btn", color="link", size="sm",
+                                           style={"marginLeft": "2px", "color": "#adb5bd",
+                                                  "fontSize": "16px", "padding": "0 4px",
+                                                  "textDecoration": "none"}),
                             ], id="cmp-path-a-row",
                                style={"display": "none", "alignItems": "center", "marginTop": "4px"}),
                         ], width=6, class_name="pe-2"),
@@ -1391,6 +1443,10 @@ def _build_compare_layout() -> html.Div:
                                                  "borderRadius": "4px"}),
                                 dbc.Button("Load", id="cmp-path-b-go-btn", color="primary", size="sm",
                                            style={"marginLeft": "4px"}),
+                                dbc.Button("×", id="cmp-path-b-dismiss-btn", color="link", size="sm",
+                                           style={"marginLeft": "2px", "color": "#adb5bd",
+                                                  "fontSize": "16px", "padding": "0 4px",
+                                                  "textDecoration": "none"}),
                             ], id="cmp-path-b-row",
                                style={"display": "none", "alignItems": "center", "marginTop": "4px"}),
                         ], width=6, class_name="ps-2"),
@@ -1402,8 +1458,8 @@ def _build_compare_layout() -> html.Div:
             dbc.Card([
                 dbc.CardHeader(html.Div([
                     html.Small("Variables", className="fw-semibold text-muted me-3"),
-                    dbc.Button("Auto-match", id="cmp-automatch-btn", color="secondary",
-                               size="sm", outline=True, style={"fontSize": "11px"}),
+                    dbc.Button("Auto-match", id="cmp-automatch-btn", color="primary",
+                               size="sm", style={"fontSize": "11px"}),
                     dbc.Button("Confirm high confidence", id="cmp-bulk-confirm-btn",
                                color="success", size="sm", outline=True, disabled=True,
                                style={"fontSize": "11px", "marginLeft": "6px"}),
@@ -1424,9 +1480,12 @@ def _build_compare_layout() -> html.Div:
                     ),
                 ], style={"display": "flex", "alignItems": "center", "flexWrap": "wrap", "gap": "4px"})),
                 dbc.CardBody(
-                    html.Div(id="cmp-mapping-area",
-                             children=html.Span("Load both files and click Auto-match.",
-                                                className="text-muted small")),
+                    dcc.Loading(
+                        html.Div(id="cmp-mapping-area",
+                                 children=html.Span("Load both files and click Auto-match.",
+                                                    className="text-muted small")),
+                        type="circle", color="#0d6efd", delay_show=200,
+                    ),
                     class_name="p-2",
                 ),
                 dbc.CardFooter(html.Div([
@@ -1443,8 +1502,12 @@ def _build_compare_layout() -> html.Div:
                         dbc.Input(id="cmp-slice-b", placeholder="e.g. 0:800 or ::2", size="sm",
                                   debounce=True, style={"width": "120px", "fontSize": "11px"}),
                     ], style={"display": "flex", "alignItems": "center", "gap": "4px", "marginLeft": "8px"}),
-                    html.Span(id="cmp-run-status", className="text-muted small ms-3",
-                              style={"fontSize": "11px"}),
+                    dcc.Loading(
+                        html.Span(id="cmp-run-status", className="text-muted small ms-3",
+                                  style={"fontSize": "11px"}),
+                        type="circle", color="#0d6efd", delay_show=200,
+                        style={"marginLeft": "8px"},
+                    ),
                     html.Span("│", style={"color": "#dee2e6", "margin": "0 8px"}),
                     dbc.Button("Export mapping", id="cmp-export-mapping-btn",
                                color="link", size="sm",
@@ -1452,16 +1515,20 @@ def _build_compare_layout() -> html.Div:
                     dcc.Upload(
                         id="cmp-import-mapping-upload",
                         children=dbc.Button("Import mapping", color="link", size="sm",
-                                            style={"fontSize": "11px", "padding": "0",
-                                                   "marginLeft": "8px"}),
+                                            style={"fontSize": "11px", "padding": "0"}),
                         accept=".json",
                         multiple=False,
+                        style={"display": "inline-flex", "alignItems": "center",
+                               "marginLeft": "8px"},
                     ),
                     html.Span(id="cmp-import-status", className="text-muted",
                               style={"fontSize": "10px", "marginLeft": "6px"}),
                     dbc.Button("Download HTML Report", id="cmp-report-btn",
                                color="link", size="sm",
                                style={"fontSize": "11px", "padding": "0", "marginLeft": "auto"}),
+                    dbc.Button("Download CSV", id="cmp-csv-btn",
+                               color="link", size="sm",
+                               style={"fontSize": "11px", "padding": "0", "marginLeft": "8px"}),
                 ], style={"display": "flex", "alignItems": "center", "flexWrap": "wrap"}),
                     class_name="py-2 px-3"),
             ], class_name="border-0 shadow-sm mb-2"),
@@ -1544,6 +1611,7 @@ def make_layout(initial_path: str | None = None) -> html.Div:
         dcc.Store(id="cmp-mapping", data=[]),
         dcc.Store(id="cmp-results", data=[]),
         dcc.Download(id="cmp-download-report"),
+        dcc.Download(id="cmp-download-csv"),
         dcc.Download(id="cmp-download-mapping"),
         dcc.Store(id="app-mode", data="explore"),
 
@@ -1602,6 +1670,10 @@ def make_layout(initial_path: str | None = None) -> html.Div:
                 ),
                 dbc.Button("Load", id="path-go-btn", color="primary", size="sm",
                            style={"marginLeft": "4px"}),
+                dbc.Button("×", id="path-dismiss-btn", color="link", size="sm",
+                           style={"marginLeft": "2px", "color": "#adb5bd",
+                                  "fontSize": "16px", "padding": "0 4px",
+                                  "textDecoration": "none"}),
             ], id="path-input-row", style={"display": "none", "alignItems": "center", "marginTop": "4px"}),
             html.Div(id="open-error", className="text-danger small"),
         ], style={"display": "flex", "flexDirection": "column", "padding": "8px 0", "maxWidth": "50%"}),
@@ -2141,12 +2213,15 @@ def make_layout(initial_path: str | None = None) -> html.Div:
                     # Plot/table area
                     dbc.Card(
                         dbc.CardBody(
-                            html.Div(
-                                id="plot-graph-area",
-                                children=html.Div(
-                                    "Select a variable from the left panel.",
-                                    className="text-muted p-4 text-center",
+                            dcc.Loading(
+                                html.Div(
+                                    id="plot-graph-area",
+                                    children=html.Div(
+                                        "Select a variable from the left panel.",
+                                        className="text-muted p-4 text-center",
+                                    ),
                                 ),
+                                type="circle", color="#0d6efd", delay_show=200,
                             ),
                             class_name="p-1",
                         ),
@@ -2195,6 +2270,8 @@ app.index_string = app.index_string.replace(
 #cmp-mapping-area .dash-spreadsheet-container { overflow: auto; max-height: 420px; }
 /* Wider tooltips for file info */
 .tooltip-inner { max-width: 500px !important; }
+/* Align dcc.Upload wrapper with sibling flex items */
+#cmp-import-mapping-upload { display: inline-flex !important; align-items: center !important; line-height: 1 !important; }
 </style></head>""",
 )
 app.layout = make_layout(sys.argv[1] if len(sys.argv) > 1 else None)
@@ -2477,8 +2554,7 @@ def render_tree(active_file, search_text):
         ),
     ], style={"borderBottom": "2px solid #593196"})
 
-    root_meta = _build_metadata_node(root_attrs, 0, search_text or "", "__root__")
-    root_children = html.Div(children + root_meta, id="root-tree-children")
+    root_children = html.Div(children, id="root-tree-children")
 
     tree = [root_header, root_children]
     return tree, opts, opts
@@ -3278,6 +3354,26 @@ def download_csv(n_clicks, var_path, active_file, slice_text):
         return dash.no_update
 
 
+# Dismiss path input rows without loading
+app.clientside_callback(
+    "function(n) { return n ? {display: 'none'} : window.dash_clientside.no_update; }",
+    Output("path-input-row", "style", allow_duplicate=True),
+    Input("path-dismiss-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+app.clientside_callback(
+    "function(n) { return n ? {display: 'none'} : window.dash_clientside.no_update; }",
+    Output("cmp-path-a-row", "style", allow_duplicate=True),
+    Input("cmp-path-a-dismiss-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+app.clientside_callback(
+    "function(n) { return n ? {display: 'none'} : window.dash_clientside.no_update; }",
+    Output("cmp-path-b-row", "style", allow_duplicate=True),
+    Input("cmp-path-b-dismiss-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+
 # PNG export via clientside JS (uses Plotly's toImage)
 app.clientside_callback(
     """
@@ -3580,7 +3676,9 @@ def render_unified_table(mapping, results, filt, vars_b):
                 {"label": "skipped", "value": "skipped"},
             ]},
         },
-        style_table={"overflowX": "auto", "fontSize": "12px"},
+        style_table={"overflowX": "auto", "overflowY": "auto",
+                     "maxHeight": "420px", "fontSize": "12px"},
+        fixed_rows={"headers": True},
         style_cell={"fontFamily": "monospace", "fontSize": "11px",
                     "padding": "4px 8px", "textAlign": "left", "minWidth": "60px"},
         style_cell_conditional=[
@@ -3846,15 +3944,100 @@ def render_detail_panel(active_cell, log_scale, apply_scale, detail_mode, table_
     State("cmp-mapping", "data"),
     State("cmp-file-a-path", "data"),
     State("cmp-file-b-path", "data"),
+    State("cmp-file-b-vars", "data"),
     prevent_initial_call=True,
 )
-def download_report(_n, results, mapping, file_a, file_b):
+def download_html_report(_n_clicks, results, mapping, file_a, file_b, file_b_vars):
     if not results:
         return dash.no_update
-
     label_a = os.path.basename((file_a or "").rstrip("/\\"))
     label_b = os.path.basename((file_b or "").rstrip("/\\"))
-    ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"comparison_{label_a}_vs_{label_b}_{ts}.html"
+    ua, ub = _compute_unmatched(mapping, file_b_vars)
+    return dcc.send_string(_build_html_report(results, file_a, file_b, ua, ub), filename)
+
+
+@app.callback(
+    Output("cmp-download-csv", "data"),
+    Input("cmp-csv-btn", "n_clicks"),
+    State("cmp-results", "data"),
+    State("cmp-mapping", "data"),
+    State("cmp-file-a-path", "data"),
+    State("cmp-file-b-path", "data"),
+    State("cmp-file-b-vars", "data"),
+    prevent_initial_call=True,
+)
+def download_csv_report(_n_clicks, results, mapping, file_a, file_b, file_b_vars):
+    if not results:
+        return dash.no_update
+    label_a = os.path.basename((file_a or "").rstrip("/\\"))
+    label_b = os.path.basename((file_b or "").rstrip("/\\"))
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"comparison_{label_a}_vs_{label_b}_{ts}.csv"
+    ua, ub = _compute_unmatched(mapping, file_b_vars)
+    return dcc.send_string(_build_csv_report(results, file_a, file_b, ua, ub), filename)
+
+
+def _compute_unmatched(mapping: list, file_b_vars: list) -> tuple[list[str], list[str]]:
+    """Return (unmatched_a, unmatched_b) variable path lists from a mapping + file B var list."""
+    confirmed_a: set[str] = set()
+    confirmed_b: set[str] = set()
+    for row in (mapping or []):
+        if row.get("status") == "confirmed" and row.get("path_b"):
+            confirmed_a.add(row["path_a"])
+            confirmed_b.add(row["path_b"])
+    unmatched_a = [row["path_a"] for row in (mapping or [])
+                   if row.get("path_a") and row["path_a"] not in confirmed_a]
+    b_paths = {v["path"] for v in (file_b_vars or [])}
+    unmatched_b = sorted(b_paths - confirmed_b)
+    return unmatched_a, unmatched_b
+
+
+def _build_csv_report(results: list, file_a: str, file_b: str,
+                      unmatched_a: list | None = None, unmatched_b: list | None = None) -> str:
+    """Build a CSV comparison report string from a list of _compare_pair result dicts."""
+    import csv as _csv
+    import io as _io
+    out = _io.StringIO()
+    writer = _csv.writer(out)
+    writer.writerow(["file_a", "file_b", "generated"])
+    writer.writerow([file_a, file_b, datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")])
+    writer.writerow([])
+    writer.writerow(["variable_a", "variable_b", "shape_a", "shape_b", "shape_match",
+                     "units_a", "units_b", "units_match",
+                     "rmse", "max_abs_diff", "nan_delta",
+                     "n_perfect", "n_within", "n_outside", "tol_status", "warnings"])
+
+    def _fmt(v):
+        return "" if v is None else (f"{v:.6g}" if isinstance(v, float) else str(v))
+
+    for r in results:
+        writer.writerow([
+            r["path_a"], r["path_b"],
+            r.get("shape_a", ""), r.get("shape_b", ""),
+            "yes" if r.get("shape_match") else "no",
+            r.get("units_a", ""), r.get("units_b", ""),
+            "yes" if r.get("units_match") else "no",
+            _fmt(r.get("rmse")), _fmt(r.get("max_abs_diff")), _fmt(r.get("nan_delta")),
+            _fmt(r.get("n_perfect")), _fmt(r.get("n_within")), _fmt(r.get("n_outside")),
+            r.get("tol_status", ""), _build_warnings(r),
+        ])
+
+    for path in (unmatched_a or []):
+        writer.writerow([path, "", "", "", "", "", "", "", "", "", "", "", "", "", "unmatched_a", ""])
+    for path in (unmatched_b or []):
+        writer.writerow(["", path, "", "", "", "", "", "", "", "", "", "", "", "", "unmatched_b", ""])
+
+    return out.getvalue()
+
+
+def _build_html_report(results: list, file_a: str, file_b: str,
+                       unmatched_a: list | None = None, unmatched_b: list | None = None) -> str:
+    """Build the HTML comparison report string from a list of _compare_pair result dicts."""
+    label_a = os.path.basename((file_a or "").rstrip("/\\"))
+    label_b = os.path.basename((file_b or "").rstrip("/\\"))
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     parts = [
         "<!DOCTYPE html><html><head>",
@@ -3865,12 +4048,13 @@ def download_report(_n, results, mapping, file_a, file_b):
         "table{border-collapse:collapse;font-size:11px;width:100%}"
         "th,td{border:1px solid #dee2e6;padding:4px 8px;text-align:left}"
         "th{background:#f4f0fa}.ok{color:#198754}.warn{color:#fd7e14}.err{color:#dc3545}"
+        ".unmatched{color:#6c757d}"
         "</style></head><body>",
-        f"<h1>File comparison report</h1>",
+        "<h1>File comparison report</h1>",
         f"<p><b>File A:</b> {file_a}<br><b>File B:</b> {file_b}<br>"
         f"<b>Generated:</b> {ts} — {len(results)} pairs compared</p>",
         "<table><thead><tr><th>Variable A</th><th>Variable B</th><th>Shape match</th>"
-        "<th>Units match</th><th>RMSE</th><th>Max |diff|</th><th>NaN Δ</th><th>Warnings</th></tr></thead><tbody>",
+        "<th>Units match</th><th>RMSE</th><th>Max |diff|</th><th>NaN Δ</th><th>Tol. status</th><th>Warnings</th></tr></thead><tbody>",
     ]
 
     def _fmt(v):
@@ -3885,9 +4069,24 @@ def download_report(_n, results, mapping, file_a, file_b):
             f"<td>{'✓' if r['units_match'] else '✗'}</td>"
             f"<td>{_fmt(r['rmse'])}</td><td>{_fmt(r['max_abs_diff'])}</td>"
             f"<td>{_fmt(r['nan_delta'])}</td>"
+            f"<td>{r.get('tol_status', '—')}</td>"
             f"<td>{_build_warnings(r)}</td></tr>"
         )
     parts.append("</tbody></table>")
+
+    if unmatched_a:
+        parts.append(f"<h2>Unmatched in File A ({len(unmatched_a)})</h2>"
+                     "<table><thead><tr><th>Variable</th></tr></thead><tbody>")
+        for p in unmatched_a:
+            parts.append(f"<tr class='unmatched'><td>{p}</td></tr>")
+        parts.append("</tbody></table>")
+
+    if unmatched_b:
+        parts.append(f"<h2>Unmatched in File B ({len(unmatched_b)})</h2>"
+                     "<table><thead><tr><th>Variable</th></tr></thead><tbody>")
+        for p in unmatched_b:
+            parts.append(f"<tr class='unmatched'><td>{p}</td></tr>")
+        parts.append("</tbody></table>")
 
     first_fig = True
     for r in results:
@@ -3908,8 +4107,7 @@ def download_report(_n, results, mapping, file_a, file_b):
             parts.append(f"<p class='err'>Could not generate figures: {exc}</p>")
 
     parts.append("</body></html>")
-    filename = f"comparison_{label_a}_vs_{label_b}_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.html"
-    return dcc.send_string("".join(parts), filename)
+    return "".join(parts)
 
 
 # ---- Mapping export ----
@@ -3918,14 +4116,17 @@ def download_report(_n, results, mapping, file_a, file_b):
     Output("cmp-download-mapping", "data"),
     Input("cmp-export-mapping-btn", "n_clicks"),
     State("cmp-mapping", "data"),
+    State("cmp-slice-a", "value"),
+    State("cmp-slice-b", "value"),
     prevent_initial_call=True,
 )
-def export_mapping(_n, mapping):
+def export_mapping(_n, mapping, slice_a, slice_b):
     if not mapping:
         return dash.no_update
     import json as _json
-    payload = {"version": "1", "mapping": mapping}
-    filename = f"variable_mapping_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+    payload = {"version": "1", "mapping": mapping,
+               "slice_a": slice_a or "", "slice_b": slice_b or ""}
+    filename = f"variable_mapping_{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
     return dcc.send_string(_json.dumps(payload, indent=2), filename)
 
 
@@ -3934,14 +4135,17 @@ def export_mapping(_n, mapping):
 @app.callback(
     Output("cmp-mapping", "data", allow_duplicate=True),
     Output("cmp-import-status", "children"),
+    Output("cmp-slice-a", "value"),
+    Output("cmp-slice-b", "value"),
     Input("cmp-import-mapping-upload", "contents"),
     State("cmp-file-a-vars", "data"),
     State("cmp-file-b-vars", "data"),
     prevent_initial_call=True,
 )
 def import_mapping(contents, vars_a, vars_b):
+    no = dash.no_update
     if not contents:
-        return dash.no_update, ""
+        return no, "", no, no
     import json as _json
     import base64 as _b64
     try:
@@ -3949,9 +4153,12 @@ def import_mapping(contents, vars_a, vars_b):
         payload = _json.loads(_b64.b64decode(_data).decode("utf-8"))
         mapping = payload.get("mapping") if isinstance(payload, dict) else payload
         if not isinstance(mapping, list):
-            return dash.no_update, "Invalid file."
+            return no, "Invalid file.", no, no
     except Exception as exc:
-        return dash.no_update, f"Error: {exc}"
+        return no, f"Error: {exc}", no, no
+
+    slice_a = payload.get("slice_a", "") if isinstance(payload, dict) else ""
+    slice_b = payload.get("slice_b", "") if isinstance(payload, dict) else ""
 
     # Warn about unmatched paths
     a_paths = {v["path"] for v in (vars_a or [])}
@@ -3962,18 +4169,147 @@ def import_mapping(contents, vars_a, vars_b):
         or (r.get("path_b") and r["path_b"] not in b_paths)
     )
     status = f"Loaded {len(mapping)} rows." + (f" {missing} paths not found in current files." if missing else "")
-    return mapping, status
+    return mapping, status, slice_a or no, slice_b or no
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _cli_explore(args: "argparse.Namespace") -> None:
+    """CLI: print variable tree and optionally values for a zarr/NC file."""
+    import json as _json
+    path = args.path
+    fmt = _detect_format(path)
+    vars_info = _get_file_vars(path)
+
+    if args.var:
+        # Single variable
+        matches = [v for v in vars_info if v["path"] == args.var]
+        if not matches:
+            print(f"Variable not found: {args.var}", file=sys.stderr)
+            sys.exit(1)
+        v = matches[0]
+        print(f"path:   {v['path']}")
+        print(f"shape:  {v['shape']}")
+        print(f"dtype:  {v['dtype']}")
+        if v.get("units"):
+            print(f"units:  {v['units']}")
+        if v.get("long_name"):
+            print(f"long_name: {v['long_name']}")
+        if args.values:
+            sl = _parse_slice(args.slice or "") if args.slice else None
+            data, _ = _load_var_data(path, args.var, apply_scale=not args.raw, time_slice=sl)
+            print(f"values:\n{data}")
+    else:
+        # Full tree
+        col_w = max((len(v["path"]) for v in vars_info), default=20)
+        header = f"{'path':<{col_w}}  {'shape':<18}  {'dtype':<10}  units"
+        print(header)
+        print("─" * len(header))
+        for v in vars_info:
+            print(f"{v['path']:<{col_w}}  {v['shape']:<18}  {v['dtype']:<10}  {v.get('units', '')}")
+
+
+def _cli_compare(args: "argparse.Namespace") -> None:
+    """CLI: run comparison using a mapping JSON and produce an HTML report."""
+    import json as _json
+
+    # Load mapping
+    with open(args.mapping, "r", encoding="utf-8") as fh:
+        payload = _json.load(fh)
+    mapping = payload.get("mapping") if isinstance(payload, dict) else payload
+    slice_a_str = payload.get("slice_a", "") if isinstance(payload, dict) else ""
+    slice_b_str = payload.get("slice_b", "") if isinstance(payload, dict) else ""
+    sl_a = _parse_slice(slice_a_str)
+    sl_b = _parse_slice(slice_b_str)
+
+    confirmed = [r for r in mapping if r.get("status") == "confirmed" and r.get("path_b")]
+    if not confirmed:
+        print("No confirmed pairs in mapping — nothing to compare.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Comparing {len(confirmed)} confirmed pairs…")
+    results = []
+    for i, row in enumerate(confirmed, 1):
+        tol = row.get("tolerance", "rel:1e-7") or "rel:1e-7"
+        r = _compare_pair(args.file_a, row["path_a"], args.file_b, row["path_b"],
+                          tolerance=tol, slice_a=sl_a, slice_b=sl_b)
+        results.append(r)
+        status = r.get("tol_status", "—")
+        warn = _build_warnings(r)
+        print(f"  [{i:>3}/{len(confirmed)}] {row['path_a']!s:<50}  {status}" +
+              (f"  ⚠ {warn}" if warn else ""))
+
+    file_b_vars = _get_file_vars(args.file_b)
+    unmatched_a, unmatched_b = _compute_unmatched(mapping, file_b_vars)
+    if unmatched_a or unmatched_b:
+        print(f"  Unmatched: {len(unmatched_a)} in A, {len(unmatched_b)} in B")
+
+    label_a = os.path.basename(args.file_a.rstrip("/\\"))
+    label_b = os.path.basename(args.file_b.rstrip("/\\"))
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+    n_perfect = sum(1 for r in results if r.get("tol_status") == "perfect")
+    n_within = sum(1 for r in results if r.get("tol_status") == "within")
+    n_outside = sum(1 for r in results if r.get("tol_status") == "outside")
+    n_err = sum(1 for r in results if r.get("error"))
+    print(f"\nDone: {n_perfect} perfect  {n_within} within  {n_outside} outside  {n_err} errors")
+
+    # Default to HTML if neither flag given
+    write_html = args.html is not None or (args.csv is None)
+    write_csv = args.csv is not None
+
+    if write_html:
+        html_path = (args.html if args.html else None) or f"comparison_{label_a}_vs_{label_b}_{ts}.html"
+        with open(html_path, "w", encoding="utf-8") as fh:
+            fh.write(_build_html_report(results, args.file_a, args.file_b, unmatched_a, unmatched_b))
+        print(f"HTML report saved to: {html_path}")
+
+    if write_csv:
+        csv_path = args.csv if args.csv else f"comparison_{label_a}_vs_{label_b}_{ts}.csv"
+        with open(csv_path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(_build_csv_report(results, args.file_a, args.file_b, unmatched_a, unmatched_b))
+        print(f"CSV  report saved to: {csv_path}")
+
+
 if __name__ == "__main__":
-    print(f"Starting Zarr Explorer v{__version__}...")
-    print("Open your browser at: http://127.0.0.1:8050")
-    try:
-        threading.Timer(1.2, lambda: webbrowser.open("http://127.0.0.1:8050")).start()
-    except Exception:
-        pass
-    app.run(debug=False, host="0.0.0.0", port=8050)
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="zarr_explorer.py",
+        description=f"Zarr Explorer v{__version__} — viewer and comparator for Zarr/NetCDF files",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # ---- explore subcommand ----
+    p_explore = sub.add_parser("explore", help="Print variable tree for a file")
+    p_explore.add_argument("path", help="Path to .zarr directory or NetCDF file")
+    p_explore.add_argument("--var", metavar="VAR_PATH", help="Focus on a specific variable path")
+    p_explore.add_argument("--values", action="store_true", help="Print array values (requires --var)")
+    p_explore.add_argument("--slice", metavar="SLICE", help="Slice to apply when printing values, e.g. '0:10' or '::4'")
+    p_explore.add_argument("--raw", action="store_true", help="Skip scaling (no scale_factor/add_offset/FillValue applied)")
+
+    # ---- compare subcommand ----
+    p_compare = sub.add_parser("compare", help="Run comparison using a mapping JSON file")
+    p_compare.add_argument("file_a", help="Path to File A (.zarr or NetCDF)")
+    p_compare.add_argument("file_b", help="Path to File B (.zarr or NetCDF)")
+    p_compare.add_argument("--mapping", required=True, metavar="FILE", help="Mapping JSON (exported from the Compare tab)")
+    p_compare.add_argument("--html", metavar="FILE", help="Write HTML report (auto-named if no path given)", nargs="?", const="")
+    p_compare.add_argument("--csv", metavar="FILE", help="Write CSV report (auto-named if no path given)", nargs="?", const="")
+
+    args = parser.parse_args()
+
+    if args.command == "explore":
+        _cli_explore(args)
+    elif args.command == "compare":
+        _cli_compare(args)
+    else:
+        # No subcommand → launch web app
+        print(f"Starting Zarr Explorer v{__version__}...")
+        print("Open your browser at: http://127.0.0.1:8050")
+        try:
+            threading.Timer(1.2, lambda: webbrowser.open("http://127.0.0.1:8050")).start()
+        except Exception:
+            pass
+        app.run(debug=False, host="0.0.0.0", port=8050)
