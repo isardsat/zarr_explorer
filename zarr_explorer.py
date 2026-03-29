@@ -63,7 +63,7 @@ def tai2000_to_utc_strings(tai: np.ndarray) -> list:
     """Convert TAI-2000 array to ISO UTC strings for Plotly datetime axis."""
     unix_ts = tai2000_to_unix(tai)
     return [
-        datetime.datetime.utcfromtimestamp(float(t)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+        datetime.datetime.fromtimestamp(float(t), tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
         for t in unix_ts
     ]
 
@@ -2495,7 +2495,7 @@ def manage_files(_open, _switch, _go,
         opts = _opts(new_files)
         return new_files, no, "", opts, no, opts, no, opts, path, no, no, no, _cmp_row_hidden, no, ""
 
-    return no, no, "", no, no, no, no, no, no, no, no, no
+    return no, no, "", no, no, no, no, no, no, no, no, no, no, no, no
 
 
 # ---- Tree rendering with search ----
@@ -3412,22 +3412,6 @@ def toggle_mode(mode):
 # Comparison callbacks
 # ---------------------------------------------------------------------------
 
-def _file_load_callback(path: str) -> tuple[str, list, str]:
-    """Shared logic for loading either file in the comparison tool."""
-    path = (path or "").strip()
-    if not path:
-        return "", [], ""
-    try:
-        fmt = _detect_format(path)
-        vars_list = _get_file_vars(path)
-        label = os.path.basename(path.rstrip("/\\"))
-        size_mb = _get_dir_size_mb(path) if fmt == "zarr" else os.path.getsize(path) / (1024 * 1024)
-        status = f"{label}  ({size_mb:.1f} MB)  —  {len(vars_list)} variables  [{fmt}]"
-        return path, vars_list, status
-    except Exception as exc:
-        return "", [], f"Error: {exc}"
-
-
 @app.callback(
     Output("cmp-file-a-path", "data"),
     Output("cmp-file-a-vars", "data"),
@@ -4035,6 +4019,7 @@ def _build_csv_report(results: list, file_a: str, file_b: str,
 def _build_html_report(results: list, file_a: str, file_b: str,
                        unmatched_a: list | None = None, unmatched_b: list | None = None) -> str:
     """Build the HTML comparison report string from a list of _compare_pair result dicts."""
+    from html import escape as _esc
     label_a = os.path.basename((file_a or "").rstrip("/\\"))
     label_b = os.path.basename((file_b or "").rstrip("/\\"))
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -4042,7 +4027,7 @@ def _build_html_report(results: list, file_a: str, file_b: str,
     parts = [
         "<!DOCTYPE html><html><head>",
         "<meta charset='utf-8'>",
-        f"<title>Comparison: {label_a} vs {label_b}</title>",
+        f"<title>Comparison: {_esc(label_a)} vs {_esc(label_b)}</title>",
         "<style>body{font-family:monospace;margin:24px;background:#fff}"
         "h1{font-size:16px}h2{font-size:13px;margin-top:28px;border-bottom:1px solid #dee2e6}"
         "table{border-collapse:collapse;font-size:11px;width:100%}"
@@ -4051,7 +4036,7 @@ def _build_html_report(results: list, file_a: str, file_b: str,
         ".unmatched{color:#6c757d}"
         "</style></head><body>",
         "<h1>File comparison report</h1>",
-        f"<p><b>File A:</b> {file_a}<br><b>File B:</b> {file_b}<br>"
+        f"<p><b>File A:</b> {_esc(file_a or '')}<br><b>File B:</b> {_esc(file_b or '')}<br>"
         f"<b>Generated:</b> {ts} — {len(results)} pairs compared</p>",
         "<table><thead><tr><th>Variable A</th><th>Variable B</th><th>Shape match</th>"
         "<th>Units match</th><th>RMSE</th><th>Max |diff|</th><th>NaN Δ</th><th>Tol. status</th><th>Warnings</th></tr></thead><tbody>",
@@ -4064,13 +4049,13 @@ def _build_html_report(results: list, file_a: str, file_b: str,
         cls = "err" if r.get("error") else ("ok" if r["shape_match"] else "warn")
         parts.append(
             f"<tr class='{cls}'>"
-            f"<td>{r['path_a']}</td><td>{r['path_b']}</td>"
+            f"<td>{_esc(r['path_a'])}</td><td>{_esc(r['path_b'])}</td>"
             f"<td>{'✓' if r['shape_match'] else '✗'}</td>"
             f"<td>{'✓' if r['units_match'] else '✗'}</td>"
             f"<td>{_fmt(r['rmse'])}</td><td>{_fmt(r['max_abs_diff'])}</td>"
             f"<td>{_fmt(r['nan_delta'])}</td>"
-            f"<td>{r.get('tol_status', '—')}</td>"
-            f"<td>{_build_warnings(r)}</td></tr>"
+            f"<td>{_esc(r.get('tol_status', '—'))}</td>"
+            f"<td>{_esc(_build_warnings(r))}</td></tr>"
         )
     parts.append("</tbody></table>")
 
@@ -4078,21 +4063,21 @@ def _build_html_report(results: list, file_a: str, file_b: str,
         parts.append(f"<h2>Unmatched in File A ({len(unmatched_a)})</h2>"
                      "<table><thead><tr><th>Variable</th></tr></thead><tbody>")
         for p in unmatched_a:
-            parts.append(f"<tr class='unmatched'><td>{p}</td></tr>")
+            parts.append(f"<tr class='unmatched'><td>{_esc(p)}</td></tr>")
         parts.append("</tbody></table>")
 
     if unmatched_b:
         parts.append(f"<h2>Unmatched in File B ({len(unmatched_b)})</h2>"
                      "<table><thead><tr><th>Variable</th></tr></thead><tbody>")
         for p in unmatched_b:
-            parts.append(f"<tr class='unmatched'><td>{p}</td></tr>")
+            parts.append(f"<tr class='unmatched'><td>{_esc(p)}</td></tr>")
         parts.append("</tbody></table>")
 
     first_fig = True
     for r in results:
         if r.get("error") or not r["shape_match"]:
             continue
-        parts.append(f"<h2>{r['path_a']}  vs  {r['path_b']}</h2>")
+        parts.append(f"<h2>{_esc(r['path_a'])}  vs  {_esc(r['path_b'])}</h2>")
         try:
             fig_overlay, fig_diff, _ = _make_compare_figures(file_a, r["path_a"], file_b, r["path_b"])
             for fig, title in [(fig_overlay, f"{r['path_a']}  vs  {r['path_b']}"),
@@ -4180,8 +4165,15 @@ def _cli_explore(args: "argparse.Namespace") -> None:
     """CLI: print variable tree and optionally values for a zarr/NC file."""
     import json as _json
     path = args.path
+    if not os.path.exists(path):
+        print(f"File not found: {path}", file=sys.stderr)
+        sys.exit(1)
     fmt = _detect_format(path)
-    vars_info = _get_file_vars(path)
+    try:
+        vars_info = _get_file_vars(path)
+    except Exception as exc:
+        print(f"Error opening file: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     if args.var:
         # Single variable
@@ -4214,6 +4206,14 @@ def _cli_explore(args: "argparse.Namespace") -> None:
 def _cli_compare(args: "argparse.Namespace") -> None:
     """CLI: run comparison using a mapping JSON and produce an HTML report."""
     import json as _json
+
+    for f in [args.file_a, args.file_b]:
+        if not os.path.exists(f):
+            print(f"File not found: {f}", file=sys.stderr)
+            sys.exit(1)
+    if not os.path.exists(args.mapping):
+        print(f"Mapping file not found: {args.mapping}", file=sys.stderr)
+        sys.exit(1)
 
     # Load mapping
     with open(args.mapping, "r", encoding="utf-8") as fh:
