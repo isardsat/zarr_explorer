@@ -1,6 +1,6 @@
 # Zarr Explorer
 
-**Version 0.3** — A browser-based viewer and comparator for Zarr and NetCDF files, built with Dash/Plotly.
+**Version 0.4** — A browser-based viewer and comparator for Zarr and NetCDF files, built with Dash/Plotly. Also usable as a CLI tool.
 
 ## Features
 
@@ -23,10 +23,29 @@
   - Editable per variable in the table
 - Color-coded results: green (perfect), yellow (within tolerance), orange (outside tolerance)
 - Per-variable counts: # perfect, # within tolerance, # outside tolerance
-- Time dimension slicing: apply independent `start:stop:step` slices to file A and B before comparison (applied only on dimensions named `time`, `record`, `epoch`, etc.)
+- Time dimension slicing: apply independent `start:stop:step` slices to file A and B before comparison
 - Detail panel on click: overlay plot, difference plot, attribute diff, value table
-- Warnings column: NaN mismatches, comparison errors, slice ignored (no time dimension found)
-- Download HTML report
+- Warnings column: NaN mismatches, comparison errors, slice ignored
+- Export/import variable mapping as JSON (includes slices and tolerances)
+- Download HTML or CSV comparison report (includes unmatched variables from both files)
+- Compare zarr `other_metadata` scalar fields as virtual variables (`group/.meta/other_metadata/key`)
+
+### CLI
+
+```bash
+# Explore a file
+python zarr_explorer.py explore path/to/file.zarr
+python zarr_explorer.py explore path/to/file.zarr --var measurements/waveform --values
+python zarr_explorer.py explore path/to/file.zarr --var measurements/waveform --values --slice 0:10 --raw
+
+# Compare two files using a mapping JSON (exported from the Compare tab)
+python zarr_explorer.py compare file_a.zarr file_b.nc --mapping mapping.json
+python zarr_explorer.py compare file_a.zarr file_b.nc --mapping mapping.json --html report.html
+python zarr_explorer.py compare file_a.zarr file_b.nc --mapping mapping.json --csv report.csv
+python zarr_explorer.py compare file_a.zarr file_b.nc --mapping mapping.json --html --csv
+```
+
+CLI compare output includes unmatched variables from both files. Defaults to HTML if neither `--html` nor `--csv` is given.
 
 ## Requirements
 
@@ -69,15 +88,15 @@ Auto-detection rules:
 - Floating-point without scale_factor → `rel:1e-7`
 - Variables with `flag` in the name → `exact`
 
-## Time slice syntax
+## Slice syntax
 
-Standard Python slice notation applied to the time/record dimension:
+Standard Python slice notation:
 
 | Slice | Meaning |
 |-------|---------|
-| `0:800` | First 800 records |
-| `100:` | From record 100 onwards |
-| `::2` | Every other record (decimation ×2) |
-| `0:800:2` | First 800 records, every other one |
+| `0:800` | First 800 elements |
+| `100:` | From element 100 onwards |
+| `::2` | Every other element |
+| `1:7:2` | Elements 1, 3, 5 |
 
-The slice is applied only on dimensions named `time`, `record`, `epoch`, `tai`, `utc`, or similar. Variables without a matching dimension are compared as-is. A warning is shown if a slice was specified but no time dimension was found.
+In the Compare tab, slices are applied to the time/record dimension of each file independently. Variables without a matching dimension are compared as-is.
