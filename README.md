@@ -26,7 +26,7 @@
 - Time dimension slicing: apply independent `start:stop:step` slices to file A and B before comparison
 - Detail panel on click: overlay plot, difference plot, attribute diff, value table
 - Warnings column: NaN mismatches, comparison errors, slice ignored
-- Export/import variable mapping as JSON (includes slices and tolerances)
+- Export/import variable mapping as JSON — minimal format (path_a, path_b, status, tolerance, slices)
 - Download HTML or CSV comparison report (includes unmatched variables from both files)
 - Compare zarr `other_metadata` scalar fields as virtual variables (`group/.meta/other_metadata/key`)
 
@@ -35,6 +35,7 @@
 ```bash
 # Explore a file
 python zarr_explorer.py explore path/to/file.zarr
+python zarr_explorer.py explore path/to/file.zarr --var measurements/waveform          # full attrs + other_metadata
 python zarr_explorer.py explore path/to/file.zarr --var measurements/waveform --values
 python zarr_explorer.py explore path/to/file.zarr --var measurements/waveform --values --slice 0:10 --raw
 
