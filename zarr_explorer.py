@@ -4090,7 +4090,12 @@ def export_mapping(_n, mapping, slice_a, slice_b):
     if not mapping:
         return dash.no_update
     import json as _json
-    payload = {"version": "1", "mapping": mapping,
+    minimal = [
+        {"path_a": r.get("path_a", ""), "path_b": r.get("path_b", ""),
+         "status": r.get("status", "pending"), "tolerance": r.get("tolerance", "rel:1e-7")}
+        for r in mapping
+    ]
+    payload = {"version": "2", "mapping": minimal,
                "slice_a": slice_a or "", "slice_b": slice_b or ""}
     filename = f"variable_mapping_{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
     return dcc.send_string(_json.dumps(payload, indent=2), filename)
@@ -4170,6 +4175,29 @@ def _cli_explore(args: "argparse.Namespace") -> None:
             print(f"units:  {v['units']}")
         if v.get("long_name"):
             print(f"long_name: {v['long_name']}")
+        # Full attributes (including other_metadata scalars)
+        try:
+            s = zarr.open(path, mode="r") if fmt == "zarr" else None
+            raw_attrs = dict(s[v['path']].attrs) if s is not None else {}
+            if raw_attrs:
+                print("\n--- attributes ---")
+                for k, av in raw_attrs.items():
+                    if isinstance(av, dict):
+                        print(f"{k}:")
+                        for sk, sv in av.items():
+                            if isinstance(sv, dict) and "data" in sv and sv.get("dims") == []:
+                                dtype_s = sv.get("dtype", "")
+                                units_s = sv.get("attrs", {}).get("units", "")
+                                long_s = sv.get("attrs", {}).get("long_name", "")
+                                suffix = "  [" + ", ".join(x for x in [dtype_s, units_s] if x) + "]" if (dtype_s or units_s) else ""
+                                long_str = f"  — {long_s}" if long_s else ""
+                                print(f"  {sk}: {sv['data']}{suffix}{long_str}")
+                            else:
+                                print(f"  {sk}: {sv}")
+                    else:
+                        print(f"{k}: {av}")
+        except Exception:
+            pass
         if args.values:
             sl = _parse_slice(args.slice or "", warn=True) if args.slice else None
             data, _ = _load_var_data(path, args.var, apply_scale=not args.raw, time_slice=sl)
