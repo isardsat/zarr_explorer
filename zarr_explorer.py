@@ -8,10 +8,11 @@ Web UI:
 
 CLI:
     python zarr_explorer.py explore <path> [--var VAR_PATH] [--values] [--slice SLICE]
-    python zarr_explorer.py compare <file_a> <file_b> --mapping mapping.json [--output report.html]
+    python zarr_explorer.py compare <file_a> <file_b> --mapping mapping.json [--html] [--csv]
+    python zarr_explorer.py convert <source> --target-sample <sample> --mapping mapping.json --output <output>
 """
 
-__version__ = "0.4"
+__version__ = "0.5"
 
 import datetime
 import difflib
@@ -4282,6 +4283,326 @@ def _cli_compare(args: "argparse.Namespace") -> None:
         print(f"CSV  report saved to: {csv_path}")
 
 
+# ---------------------------------------------------------------------------
+# Converter helpers (zarr ↔ NetCDF)
+# ---------------------------------------------------------------------------
+
+
+def _encode_data(decoded: np.ndarray, target_attrs: dict) -> np.ndarray:
+    """Re-encode decoded float data using target scale_factor / add_offset / _FillValue / dtype.
+
+    Inverse of CF decoding:  decoded = encoded * scale + offset
+                         →   encoded = (decoded − offset) / scale
+    """
+    scale = float(target_attrs.get("scale_factor", 1.0))
+    offset = float(target_attrs.get("add_offset", 0.0))
+    fill = target_attrs.get("_FillValue", None)
+    dtype_str = target_attrs.get("_dtype", None)
+
+    nan_mask = np.isnan(decoded) if np.issubdtype(decoded.dtype, np.floating) else np.zeros(decoded.shape, dtype=bool)
+
+    # Arithmetic always produces a new array; the else branch needs an explicit copy
+    # to avoid mutating the caller's data (numpy ≥ 2.0 .astype may return a view).
+    if scale != 1.0 or offset != 0.0:
+        encoded = (decoded.astype(float) - offset) / scale
+    else:
+        encoded = np.array(decoded, dtype=float, copy=True)
+
+    try:
+        target_dtype = np.dtype(dtype_str) if dtype_str else decoded.dtype
+    except Exception:
+        target_dtype = decoded.dtype
+
+    if np.issubdtype(target_dtype, np.integer):
+        info = np.iinfo(target_dtype)
+        encoded = np.clip(np.round(encoded), info.min, info.max)
+
+    if fill is not None:
+        encoded[nan_mask] = float(fill)
+    elif nan_mask.any() and np.issubdtype(target_dtype, np.integer):
+        encoded[nan_mask] = float(np.iinfo(target_dtype).max)
+
+    return encoded.astype(target_dtype)
+
+
+def _collect_nc_var_attrs(nc_path: str) -> dict[str, dict]:
+    """Return {var_path: attrs} for all variables in a NetCDF file.
+
+    Attrs include _dtype (str), _dimensions (list[str]), _FillValue (float, if set),
+    and all variable-level attributes.
+    """
+    import netCDF4 as _nc4
+    result: dict[str, dict] = {}
+
+    def _recurse(grp, prefix: str) -> None:
+        for name, var in grp.variables.items():
+            path = f"{prefix}/{name}" if prefix else name
+            attrs: dict = {k: var.getncattr(k) for k in var.ncattrs()}
+            attrs["_dtype"] = str(var.dtype)
+            attrs["_dimensions"] = list(var.dimensions)
+            try:
+                fv = var._FillValue
+                if fv is not None:
+                    attrs["_FillValue"] = float(fv)
+            except AttributeError:
+                pass
+            result[path] = attrs
+        for grp_name, child_grp in grp.groups.items():
+            _recurse(child_grp, f"{prefix}/{grp_name}" if prefix else grp_name)
+
+    ds = _nc4.Dataset(nc_path)
+    try:
+        _recurse(ds, "")
+    finally:
+        ds.close()
+    return result
+
+
+def _collect_zarr_var_attrs(zarr_path: str) -> dict[str, dict]:
+    """Return {var_path: attrs} for all arrays in a zarr file.
+
+    Attrs include _dtype (str) plus all zarr array attributes.
+    """
+    result: dict[str, dict] = {}
+    s = zarr.open(zarr_path, mode="r")
+
+    def _recurse(node, prefix: str) -> None:
+        if isinstance(node, zarr.Array):
+            attrs = dict(node.attrs)
+            attrs["_dtype"] = str(node.dtype)
+            result[prefix] = attrs
+            return
+        for name, child in node.members():
+            _recurse(child, f"{prefix}/{name}" if prefix else name)
+
+    _recurse(s, "")
+    return result
+
+
+_NC_WRITE_SKIP_ATTRS = frozenset({"_dtype", "_dimensions", "_FillValue", "_detected_time_axis"})
+_ZARR_WRITE_SKIP_ATTRS = frozenset({"_dtype", "_detected_time_axis"})
+
+
+def _write_nc_var(ds_out, var_path: str, data: np.ndarray, attrs: dict, dim_names: list) -> None:
+    """Create a variable at var_path inside ds_out (open netCDF4.Dataset).
+
+    Groups along the path are created as needed. All dimensions are expected to already
+    exist in the root group of ds_out; dim_names provides their ordered names.
+    """
+    parts = var_path.split("/")
+    var_name = parts[-1]
+
+    grp = ds_out
+    for part in parts[:-1]:
+        grp = grp.groups[part] if part in grp.groups else grp.createGroup(part)
+
+    try:
+        nc_dtype = np.dtype(attrs.get("_dtype", str(data.dtype)))
+    except Exception:
+        nc_dtype = data.dtype
+
+    fill_value = attrs.get("_FillValue", None)
+    dim_tuple = tuple(dim_names[:data.ndim]) if dim_names else ()
+    kwargs: dict = {}
+    if fill_value is not None:
+        kwargs["fill_value"] = fill_value
+
+    var = grp.createVariable(var_name, nc_dtype, dim_tuple, **kwargs)
+    if data.ndim == 0:
+        var[()] = data.item()
+    else:
+        var[:] = data
+
+    for k, v in attrs.items():
+        if k not in _NC_WRITE_SKIP_ATTRS:
+            try:
+                setattr(var, k, v)
+            except Exception:
+                pass
+
+
+def _write_zarr_var(root: zarr.Group, var_path: str, data: np.ndarray, attrs: dict) -> None:
+    """Write data to a zarr array at var_path, creating groups as needed.
+
+    Handles virtual other_metadata paths (group/.meta/other_metadata/key) by
+    writing into the group's other_metadata attribute dict rather than creating an array.
+    """
+    # Virtual other_metadata path → update group attribute dict
+    if "/.meta/other_metadata/" in var_path or var_path.startswith(".meta/other_metadata/"):
+        if var_path.startswith(".meta/other_metadata/"):
+            grp_path, key = "", var_path.split("other_metadata/", 1)[1]
+        else:
+            grp_path, key = var_path.split("/.meta/other_metadata/", 1)
+        grp = root
+        if grp_path:
+            for part in grp_path.split("/"):
+                grp = grp.require_group(part)
+        existing: dict = dict(grp.attrs).get("other_metadata", {})
+        val = data.item() if hasattr(data, "item") else float(data)
+        meta_attrs = {k: v for k, v in attrs.items()
+                      if k not in _ZARR_WRITE_SKIP_ATTRS | {"scale_factor", "add_offset", "_FillValue"}}
+        existing[key] = {"data": val, "dims": [], "attrs": meta_attrs}
+        grp.attrs["other_metadata"] = existing
+        return
+
+    # Regular array path
+    parts = var_path.split("/")
+    var_name = parts[-1]
+    grp = root
+    for part in parts[:-1]:
+        grp = grp.require_group(part)
+
+    fill_value = attrs.get("_FillValue", None)
+    arr = grp.create_array(var_name, shape=data.shape, dtype=str(data.dtype), fill_value=fill_value)
+    if data.ndim == 0:
+        arr[()] = data.item()
+    else:
+        arr[:] = data
+
+    write_attrs = {k: v for k, v in attrs.items() if k not in _ZARR_WRITE_SKIP_ATTRS}
+    if write_attrs:
+        arr.attrs.update(write_attrs)
+
+
+def _convert_zarr_to_nc(src_zarr: str, sample_nc: str, confirmed: list[dict], output_path: str) -> int:
+    """Convert confirmed zarr variables to NetCDF, using sample_nc for encoding/structure.
+
+    Returns number of errors.
+    """
+    import netCDF4 as _nc4
+
+    sample_attrs = _collect_nc_var_attrs(sample_nc)
+
+    # First pass: load, decode, re-encode — collect dimension sizes along the way
+    loaded: list = []  # (path_a, path_b, encoded | None, tgt_attrs, dim_names)
+    all_dims: dict[str, int] = {}
+
+    print(f"Loading {len(confirmed)} variable(s) from {os.path.basename(src_zarr)}...")
+    for row in confirmed:
+        path_a, path_b = row["path_a"], row["path_b"]
+        try:
+            data, _ = _load_var_data(src_zarr, path_a, apply_scale=True)
+            tgt_attrs = sample_attrs.get(path_b, {})
+            if not tgt_attrs:
+                print(f"  Warning: '{path_b}' not found in target sample — writing as float64", file=sys.stderr)
+            encoded = _encode_data(data, tgt_attrs)
+            dim_names = tgt_attrs.get("_dimensions", [])
+            if not dim_names and encoded.ndim > 0:
+                dim_names = [f"dim_{i}" for i in range(encoded.ndim)]
+            for dname, dsize in zip(dim_names, encoded.shape):
+                if dname in all_dims and all_dims[dname] != dsize:
+                    print(f"  Warning: dimension '{dname}' size conflict "
+                          f"({all_dims[dname]} vs {dsize}, from {path_a}) — keeping first", file=sys.stderr)
+                else:
+                    all_dims[dname] = dsize
+            loaded.append((path_a, path_b, encoded, tgt_attrs, dim_names))
+        except Exception as exc:
+            print(f"  Warning: skipping {path_a}: {exc}", file=sys.stderr)
+            loaded.append((path_a, path_b, None, {}, []))
+
+    # Build output NC: all shared dims declared in root, variables in their respective groups
+    ds_out = _nc4.Dataset(output_path, "w", format="NETCDF4")
+    try:
+        for dname, dsize in all_dims.items():
+            ds_out.createDimension(dname, dsize)
+
+        errors = 0
+        for i, (path_a, path_b, encoded, tgt_attrs, dim_names) in enumerate(loaded, 1):
+            tag = f"[{i:>3}/{len(loaded)}]"
+            if encoded is None:
+                print(f"  {tag} SKIP  {path_a}")
+                errors += 1
+                continue
+            try:
+                _write_nc_var(ds_out, path_b, encoded, tgt_attrs, dim_names)
+                print(f"  {tag} ok    {path_a}  →  {path_b}")
+            except Exception as exc:
+                print(f"  {tag} ERROR {path_b}: {exc}", file=sys.stderr)
+                errors += 1
+    finally:
+        ds_out.close()
+    return errors
+
+
+def _convert_nc_to_zarr(src_nc: str, sample_zarr: str, confirmed: list[dict], output_path: str) -> int:
+    """Convert confirmed NC variables to zarr, using sample_zarr for encoding/structure.
+
+    Returns number of errors.
+    """
+    sample_attrs = _collect_zarr_var_attrs(sample_zarr)
+    root_out = zarr.open(output_path, mode="w")
+
+    errors = 0
+    for i, row in enumerate(confirmed, 1):
+        path_a, path_b = row["path_a"], row["path_b"]
+        tag = f"[{i:>3}/{len(confirmed)}]"
+        try:
+            data, _ = _load_var_data(src_nc, path_b, apply_scale=True)
+            tgt_attrs = sample_attrs.get(path_a, {})
+            if not tgt_attrs:
+                print(f"  Warning: '{path_a}' not found in target sample — writing as float64", file=sys.stderr)
+            encoded = _encode_data(data, tgt_attrs)
+            _write_zarr_var(root_out, path_a, encoded, tgt_attrs)
+            print(f"  {tag} ok    {path_b}  →  {path_a}")
+        except Exception as exc:
+            print(f"  {tag} ERROR {path_b}: {exc}", file=sys.stderr)
+            errors += 1
+
+    return errors
+
+
+def _cli_convert(args: "argparse.Namespace") -> None:
+    """CLI: convert a zarr file to NetCDF or vice-versa using a mapping JSON."""
+    import json as _json
+
+    for label, path in [("source", args.source), ("--target-sample", args.target_sample),
+                        ("--mapping", args.mapping)]:
+        if not os.path.exists(path):
+            print(f"File not found ({label}): {path}", file=sys.stderr)
+            sys.exit(1)
+
+    src_fmt = _detect_format(args.source)
+    tgt_fmt = _detect_format(args.target_sample)
+
+    if src_fmt == tgt_fmt:
+        print(f"Error: source and --target-sample are both '{src_fmt}'. "
+              "Provide files of different formats.", file=sys.stderr)
+        sys.exit(1)
+
+    with open(args.mapping, "r", encoding="utf-8") as fh:
+        payload = _json.load(fh)
+    mapping = payload.get("mapping") if isinstance(payload, dict) else payload
+
+    confirmed = [r for r in mapping if r.get("status") == "confirmed" and r.get("path_a") and r.get("path_b")]
+    skipped = [r for r in mapping if r not in confirmed]
+
+    if skipped:
+        paths = [r.get("path_a") or r.get("path_b", "?") for r in skipped]
+        preview = ", ".join(str(p) for p in paths[:5]) + ("…" if len(paths) > 5 else "")
+        print(f"Warning: {len(skipped)} variable(s) not confirmed in mapping — skipping: {preview}")
+
+    if not confirmed:
+        print("No confirmed pairs in mapping — nothing to convert.", file=sys.stderr)
+        sys.exit(1)
+
+    tgt_label = "netcdf" if tgt_fmt == "netcdf" else "zarr"
+    print(f"Converting {len(confirmed)} variable(s)  [{src_fmt} → {tgt_label}]")
+    print(f"  source:         {args.source}")
+    print(f"  target sample:  {args.target_sample}")
+    print(f"  output:         {args.output}")
+
+    if src_fmt == "zarr":
+        errors = _convert_zarr_to_nc(args.source, args.target_sample, confirmed, args.output)
+    else:
+        errors = _convert_nc_to_zarr(args.source, args.target_sample, confirmed, args.output)
+
+    if errors:
+        print(f"\nCompleted with {errors} error(s). Output: {args.output}")
+        sys.exit(1)
+    else:
+        print(f"\nDone. Output: {args.output}")
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -4307,12 +4628,23 @@ if __name__ == "__main__":
     p_compare.add_argument("--html", metavar="FILE", help="Write HTML report (auto-named if no path given)", nargs="?", const="")
     p_compare.add_argument("--csv", metavar="FILE", help="Write CSV report (auto-named if no path given)", nargs="?", const="")
 
+    # ---- convert subcommand ----
+    p_convert = sub.add_parser("convert", help="Convert between zarr and NetCDF using a mapping JSON")
+    p_convert.add_argument("source", help="Source file (.zarr directory or NetCDF)")
+    p_convert.add_argument("--target-sample", required=True, metavar="FILE",
+                           help="Sample file in the target format — provides encoding/structure template")
+    p_convert.add_argument("--mapping", required=True, metavar="FILE",
+                           help="Mapping JSON (exported from the Compare tab)")
+    p_convert.add_argument("--output", required=True, metavar="FILE", help="Output file path")
+
     args = parser.parse_args()
 
     if args.command == "explore":
         _cli_explore(args)
     elif args.command == "compare":
         _cli_compare(args)
+    elif args.command == "convert":
+        _cli_convert(args)
     else:
         # No subcommand → launch web app
         print(f"Starting Zarr Explorer v{__version__}...")

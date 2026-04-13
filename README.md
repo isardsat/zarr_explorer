@@ -1,6 +1,6 @@
 # Zarr Explorer
 
-**Version 0.4** — A browser-based viewer and comparator for Zarr and NetCDF files, built with Dash/Plotly. Also usable as a CLI tool.
+**Version 0.5** — A browser-based viewer and comparator for Zarr and NetCDF files, built with Dash/Plotly. Also usable as a CLI tool.
 
 ## Features
 
@@ -44,9 +44,26 @@ python zarr_explorer.py compare file_a.zarr file_b.nc --mapping mapping.json
 python zarr_explorer.py compare file_a.zarr file_b.nc --mapping mapping.json --html report.html
 python zarr_explorer.py compare file_a.zarr file_b.nc --mapping mapping.json --csv report.csv
 python zarr_explorer.py compare file_a.zarr file_b.nc --mapping mapping.json --html --csv
+
+# Convert between zarr and NetCDF using a mapping JSON
+python zarr_explorer.py convert file_a.zarr --target-sample file_b.nc --mapping mapping.json --output output.nc
+python zarr_explorer.py convert file_b.nc --target-sample file_a.zarr --mapping mapping.json --output output.zarr
 ```
 
 CLI compare output includes unmatched variables from both files. Defaults to HTML if neither `--html` nor `--csv` is given.
+
+### Convert
+
+Convert variables between zarr and NetCDF formats. Requires a mapping JSON (exported from the Compare tab) and a **target sample** file — an existing file in the target format that provides the encoding template (dtype, `scale_factor`, `add_offset`, `_FillValue`, dimension names).
+
+The conversion direction is detected automatically from the source and target-sample file formats.
+
+**How it works:**
+1. Source data is decoded (CF scale/offset applied, FillValue → NaN)
+2. Re-encoded using the target sample's attributes (reverse scale/offset, NaN → FillValue, cast to target dtype)
+3. Written to the output file with the target's structure and encoding
+
+Only confirmed pairs in the mapping are converted. Unmatched or skipped variables produce a warning.
 
 ## Requirements
 
