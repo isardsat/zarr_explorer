@@ -4370,6 +4370,10 @@ def _collect_zarr_var_attrs(zarr_path: str) -> dict[str, dict]:
         if isinstance(node, zarr.Array):
             attrs = dict(node.attrs)
             attrs["_dtype"] = str(node.dtype)
+            attrs["_zarr_fill_value"] = node.metadata.fill_value
+            attrs["_zarr_chunks"] = node.chunks
+            # zarr v2 stores compressor on metadata; zarr v3 uses codecs
+            attrs["_zarr_compressor"] = getattr(node.metadata, "compressor", None)
             result[prefix] = attrs
             return
         for name, child in node.members():
@@ -4380,7 +4384,7 @@ def _collect_zarr_var_attrs(zarr_path: str) -> dict[str, dict]:
 
 
 _NC_WRITE_SKIP_ATTRS = frozenset({"_dtype", "_dimensions", "_FillValue", "_detected_time_axis"})
-_ZARR_WRITE_SKIP_ATTRS = frozenset({"_dtype", "_detected_time_axis"})
+_ZARR_WRITE_SKIP_ATTRS = frozenset({"_dtype", "_detected_time_axis", "_zarr_fill_value", "_zarr_chunks", "_zarr_compressor"})
 
 
 def _write_nc_var(ds_out, var_path: str, data: np.ndarray, attrs: dict, dim_names: list) -> None:
@@ -4452,8 +4456,18 @@ def _write_zarr_var(root: zarr.Group, var_path: str, data: np.ndarray, attrs: di
     for part in parts[:-1]:
         grp = grp.require_group(part)
 
-    fill_value = attrs.get("_FillValue", None)
-    arr = grp.create_array(var_name, shape=data.shape, dtype=str(data.dtype), fill_value=fill_value)
+    fill_value = attrs.get("_zarr_fill_value", attrs.get("_FillValue", None))
+    chunks = attrs.get("_zarr_chunks")
+    compressor = attrs.get("_zarr_compressor")
+    # chunks from sample may have wrong ndim if variable was reshaped
+    if chunks is not None and len(chunks) != data.ndim:
+        chunks = None
+    create_kw: dict = {"shape": data.shape, "dtype": str(data.dtype), "fill_value": fill_value}
+    if chunks is not None:
+        create_kw["chunks"] = chunks
+    if compressor is not None:
+        create_kw["compressor"] = compressor
+    arr = grp.create_array(var_name, **create_kw)
     if data.ndim == 0:
         arr[()] = data.item()
     else:
@@ -4572,6 +4586,9 @@ def _convert_nc_to_zarr(src_nc: str, sample_zarr: str, confirmed: list[dict], ou
         except Exception as exc:
             print(f"  {tag} ERROR {path_b}: {exc}", file=sys.stderr)
             errors += 1
+
+    if zarr_format == 2:
+        zarr.consolidate_metadata(output_path)
 
     return errors
 
