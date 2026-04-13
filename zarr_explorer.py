@@ -2248,73 +2248,6 @@ app.layout = _serve_layout
 
 
 # ---------------------------------------------------------------------------
-# Native folder picker (tkinter subprocess)
-# ---------------------------------------------------------------------------
-
-def _open_folder_dialog() -> str | None:
-    """Open a native file/folder picker. Returns selected path, '' if cancelled, None if failed."""
-    import subprocess as _sp
-    import platform as _platform
-
-    initialdir = os.path.dirname(os.path.abspath(sys.argv[0]))
-
-    if _platform.system() == "Darwin":
-        # osascript choose file or folder handles both NetCDF files and Zarr directories
-        safe_dir = initialdir.replace('"', '\\"')
-        script = (
-            f'set defaultDir to POSIX file "{safe_dir}"\n'
-            "try\n"
-            "    set chosen to choose file or folder with prompt "
-            '"Select a Zarr directory or NetCDF file" default location defaultDir\n'
-            "    POSIX path of chosen\n"
-            "on error\n"
-            '    ""\n'
-            "end try"
-        )
-        try:
-            result = _sp.run(["osascript", "-e", script], capture_output=True, text=True, timeout=30)
-            path = result.stdout.strip()
-            if path:
-                return path
-            if result.returncode != 0:
-                return None  # osascript failed
-            return ""  # user cancelled
-        except Exception:
-            return None
-
-    # Non-macOS: file dialog first (NetCDF), then directory dialog (Zarr) if cancelled
-    _picker_script = (
-        "import tkinter as tk\n"
-        "from tkinter import filedialog\n"
-        "root = tk.Tk()\n"
-        "root.withdraw()\n"
-        "root.call('wm', 'attributes', '.', '-topmost', True)\n"
-        "root.lift()\n"
-        "root.focus_force()\n"
-        f"initialdir = {repr(initialdir)}\n"
-        "path = filedialog.askopenfilename(\n"
-        "    title='Select NetCDF file', initialdir=initialdir,\n"
-        "    filetypes=[('NetCDF / HDF5', '*.nc *.h5 *.hdf5 *.he5 *.nc4'), ('All files', '*')])\n"
-        "if not path:\n"
-        "    path = filedialog.askdirectory(title='Select Zarr directory', initialdir=initialdir)\n"
-        "print(path or '')\n"
-    )
-    try:
-        result = _sp.run(
-            [sys.executable, "-c", _picker_script],
-            capture_output=True, text=True, timeout=30,
-        )
-        path = result.stdout.strip()
-        if path:
-            return path
-        if result.returncode != 0 or result.stderr.strip():
-            return None
-        return ""
-    except Exception:
-        return None
-
-
-# ---------------------------------------------------------------------------
 # Callbacks
 # ---------------------------------------------------------------------------
 
@@ -2390,14 +2323,6 @@ def manage_files(_open, _switch, _go,
             return None, str(e)
 
     if triggered == "open-btn":
-        picked = _open_folder_dialog()
-        if picked:
-            new_files, err = _do_open(picked)
-            if err:
-                return no, no, f"Failed to open: {err}", no, no, no, no, no, no, no, no, no, no, no, no
-            opts = _opts(new_files)
-            return new_files, picked, "", opts, picked, opts, no, opts, no, _path_hidden, "", no, no, no, no
-        # dialog failed or cancelled → show path input fallback
         return no, no, "", no, no, no, no, no, no, _path_shown, "", no, no, no, no
 
     if triggered == "path-go-btn":
@@ -2424,25 +2349,9 @@ def manage_files(_open, _switch, _go,
         return no, _switch, "", no, no, no, no, no, no, no, no, no, no, no, no
 
     if triggered == "cmp-open-a-btn":
-        picked = _open_folder_dialog()
-        if picked:
-            new_files, err = _do_open(picked)
-            if err:
-                return no, no, f"Failed to open: {err}", no, no, no, no, no, no, no, no, no, no, no, no
-            opts = _opts(new_files)
-            return new_files, no, "", opts, no, opts, picked, opts, no, no, no, _cmp_row_hidden, no, "", no
-        # dialog failed or cancelled → show inline path input
         return no, no, "", no, no, no, no, no, no, no, no, _cmp_row_shown, no, no, no
 
     if triggered == "cmp-open-b-btn":
-        picked = _open_folder_dialog()
-        if picked:
-            new_files, err = _do_open(picked)
-            if err:
-                return no, no, f"Failed to open: {err}", no, no, no, no, no, no, no, no, no, no, no, no
-            opts = _opts(new_files)
-            return new_files, no, "", opts, no, opts, no, opts, picked, no, no, no, _cmp_row_hidden, no, ""
-        # dialog failed or cancelled → show inline path input
         return no, no, "", no, no, no, no, no, no, no, no, no, _cmp_row_shown, no, no
 
     if triggered == "cmp-path-a-go-btn":
