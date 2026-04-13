@@ -15,6 +15,12 @@
 - Per-variable statistics: min, max, mean, std, NaN count
 - Attribute viewer
 
+### Convert (CLI)
+- Convert variables between zarr and NetCDF using a mapping JSON from the Compare tab
+- Target sample file provides the encoding template (dtype, scale_factor, add_offset, FillValue, dimensions)
+- Group-level metadata (other_metadata, product info) copied from the sample; data values from the source
+- Direction auto-detected from file formats; zarr output format selectable (v2 or v3)
+
 ### Compare tab
 - Load two Zarr or NetCDF files and auto-match variables by name/path
 - Manual match override via in-table dropdown
@@ -62,7 +68,8 @@ The conversion direction is detected automatically from the source and target-sa
 **How it works:**
 1. Source data is decoded (CF scale/offset applied, FillValue → NaN)
 2. Re-encoded using the target sample's attributes (reverse scale/offset, NaN → FillValue, cast to target dtype)
-3. Written to the output file with the target's structure and encoding
+3. For zarr output: all group-level metadata (other_metadata, product info, processing attrs) is copied from the sample first; confirmed-pair data values overwrite specific keys on top
+4. Written to the output file with the target's structure and encoding
 
 Only confirmed pairs in the mapping are converted. Unmatched or skipped variables produce a warning.
 
