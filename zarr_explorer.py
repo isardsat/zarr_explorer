@@ -999,6 +999,91 @@ def _parse_slice(s: str, warn: bool = False) -> slice | None:
         return None
 
 
+def _zarr_v2_read_raw(store_path: str, array_path: str) -> np.ndarray:
+    """Read a zarr v2 array by directly reading chunk files + numcodecs decode.
+
+    Bypasses zarr-python 3's async chunk pipeline, which breaks under Python 3.13
+    when an asyncio event loop (e.g. Dash) has already run in the same process.
+    """
+    import json as _json, math as _math, numcodecs as _nc
+
+    base = os.path.join(store_path, array_path)
+    zm: dict | None = None
+
+    # Try .zarray first; some zarr v2 stores write 0-byte .zarray placeholders
+    zarray_file = os.path.join(base, ".zarray")
+    if os.path.getsize(zarray_file) > 0:
+        with open(zarray_file) as _fh:
+            try:
+                zm = _json.load(_fh)
+            except ValueError:
+                zm = None
+
+    # Fall back to consolidated .zmetadata when .zarray is empty/corrupt
+    if zm is None:
+        zmeta_path = os.path.join(store_path, ".zmetadata")
+        if os.path.exists(zmeta_path):
+            with open(zmeta_path) as _fh:
+                _zmeta = _json.load(_fh)
+            zm = _zmeta.get("metadata", {}).get(f"{array_path}/.zarray")
+
+    if zm is None:
+        raise FileNotFoundError(f"zarr array metadata not found for {array_path}")
+
+    dtype = np.dtype(zm["dtype"])
+    shape = tuple(zm["shape"])
+    chunks = tuple(zm["chunks"])
+    order = zm.get("order", "C")
+    sep = zm.get("dimension_separator", ".")
+    fv_raw = zm.get("fill_value", 0)
+
+    if fv_raw == "NaN":
+        fv: object = np.nan
+    elif fv_raw == "Infinity":
+        fv = np.inf
+    elif fv_raw == "-Infinity":
+        fv = -np.inf
+    else:
+        fv = fv_raw if fv_raw is not None else 0
+
+    codec = _nc.get_codec(zm["compressor"]) if zm.get("compressor") else None
+    filters = [_nc.get_codec(f) for f in (zm.get("filters") or [])]
+
+    if not shape:  # scalar
+        chunk_file = os.path.join(base, "0")
+        if not os.path.exists(chunk_file):
+            return np.full((), fv, dtype=dtype)
+        with open(chunk_file, "rb") as _fh:
+            raw = _fh.read()
+        if codec:
+            raw = codec.decode(raw)
+        for f in reversed(filters):
+            raw = f.decode(raw)
+        return np.frombuffer(raw, dtype=dtype).reshape(())
+
+    out = np.full(shape, fv, dtype=dtype, order=order)
+    n_chunks = tuple(_math.ceil(s / c) for s, c in zip(shape, chunks))
+
+    for ci in np.ndindex(*n_chunks):
+        chunk_file = os.path.join(base, sep.join(str(i) for i in ci))
+        if not os.path.exists(chunk_file):
+            continue
+        with open(chunk_file, "rb") as _fh:
+            raw = _fh.read()
+        if not raw:  # 0-byte file = empty chunk = fill_value (zarr v2 sparse storage)
+            continue
+        if codec:
+            raw = codec.decode(raw)
+        for f in reversed(filters):
+            raw = f.decode(raw)
+        chunk_arr = np.frombuffer(raw, dtype=dtype).reshape(chunks, order=order)
+        dst = tuple(slice(i * c, min((i + 1) * c, s)) for i, c, s in zip(ci, chunks, shape))
+        src = tuple(slice(0, d.stop - d.start) for d in dst)
+        out[dst] = chunk_arr[src]
+
+    return out
+
+
 def _detect_time_axis(node: zarr.Array, attrs: dict) -> int | None:
     """Return the axis index of the time/record dimension, or None if not found."""
     dim_names: list[str] | None = None
@@ -1055,10 +1140,37 @@ def _load_var_data(file_path: str, var_path: str, apply_scale: bool = True,
         meta_attrs["_detected_time_axis"] = None
         return data, meta_attrs
     if fmt == "zarr":
-        s = zarr.open(file_path, mode="r")
-        node = s[var_path]
-        attrs = dict(node.attrs)
-        raw_data = node[:]
+        zarray_file = os.path.join(file_path, var_path, ".zarray")
+        if os.path.exists(zarray_file):
+            # zarr v2: read chunks directly to bypass zarr-python 3 async executor issues
+            # (Python 3.13 + Dash event loop interactions corrupt zarr's global executor)
+            raw_data = _zarr_v2_read_raw(file_path, var_path)
+            import json as _json
+            attrs = {}
+            zattrs_file = os.path.join(file_path, var_path, ".zattrs")
+            if os.path.exists(zattrs_file) and os.path.getsize(zattrs_file) > 0:
+                try:
+                    with open(zattrs_file) as _fh:
+                        attrs = _json.load(_fh)
+                except (ValueError, OSError):
+                    pass
+            # Fall back to .zmetadata when .zattrs is missing/empty
+            if not attrs:
+                zmeta_path = os.path.join(file_path, ".zmetadata")
+                if os.path.exists(zmeta_path):
+                    try:
+                        with open(zmeta_path) as _fh:
+                            _zmeta = _json.load(_fh)
+                        attrs = _zmeta.get("metadata", {}).get(f"{var_path}/.zattrs", {})
+                    except (ValueError, OSError):
+                        pass
+            node = None  # _detect_time_axis falls back to _ARRAY_DIMENSIONS attr
+        else:
+            # zarr v3: use zarr-python 3 (native format, no async issues)
+            s = zarr.open(file_path, mode="r")
+            node = s[var_path]
+            attrs = dict(node.attrs)
+            raw_data = node[:]
         if not np.issubdtype(raw_data.dtype, np.number) and not np.issubdtype(raw_data.dtype, np.bool_):
             raise TypeError(f"Cannot compare non-numeric array: {var_path} (dtype={raw_data.dtype})")
         data = raw_data.astype(float)
