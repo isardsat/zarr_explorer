@@ -4524,13 +4524,38 @@ def _convert_zarr_to_nc(src_zarr: str, sample_nc: str, confirmed: list[dict], ou
     return errors
 
 
-def _convert_nc_to_zarr(src_nc: str, sample_zarr: str, confirmed: list[dict], output_path: str) -> int:
+def _copy_zarr_group_attrs(sample_zarr: str, root_out: zarr.Group) -> None:
+    """Copy all group-level attributes from sample_zarr into root_out.
+
+    Provides the baseline metadata (other_metadata, product info, etc.) for the output.
+    Array attrs are skipped — those are handled per-variable. Called before variable
+    writes so that confirmed-pair data values can overwrite specific keys on top.
+    """
+    s = zarr.open(sample_zarr, mode="r")
+
+    def _recurse(src_node: zarr.Group, dst_node: zarr.Group) -> None:
+        src_attrs = dict(src_node.attrs)
+        if src_attrs:
+            dst_node.attrs.update(src_attrs)
+        for name, child in src_node.members():
+            if isinstance(child, zarr.Group):
+                _recurse(child, dst_node.require_group(name))
+
+    _recurse(s, root_out)
+
+
+def _convert_nc_to_zarr(src_nc: str, sample_zarr: str, confirmed: list[dict], output_path: str,
+                        zarr_format: int = 3) -> int:
     """Convert confirmed NC variables to zarr, using sample_zarr for encoding/structure.
 
     Returns number of errors.
     """
     sample_attrs = _collect_zarr_var_attrs(sample_zarr)
-    root_out = zarr.open(output_path, mode="w")
+    root_out = zarr.open(output_path, mode="w", zarr_format=zarr_format)
+
+    # Baseline: copy all group-level metadata from the sample. Variable writes below
+    # will overwrite specific other_metadata keys with actual source data values.
+    _copy_zarr_group_attrs(sample_zarr, root_out)
 
     errors = 0
     for i, row in enumerate(confirmed, 1):
@@ -4585,7 +4610,7 @@ def _cli_convert(args: "argparse.Namespace") -> None:
         print("No confirmed pairs in mapping — nothing to convert.", file=sys.stderr)
         sys.exit(1)
 
-    tgt_label = "netcdf" if tgt_fmt == "netcdf" else "zarr"
+    tgt_label = "netcdf" if tgt_fmt == "netcdf" else f"zarr v{args.zarr_format}"
     print(f"Converting {len(confirmed)} variable(s)  [{src_fmt} → {tgt_label}]")
     print(f"  source:         {args.source}")
     print(f"  target sample:  {args.target_sample}")
@@ -4594,7 +4619,8 @@ def _cli_convert(args: "argparse.Namespace") -> None:
     if src_fmt == "zarr":
         errors = _convert_zarr_to_nc(args.source, args.target_sample, confirmed, args.output)
     else:
-        errors = _convert_nc_to_zarr(args.source, args.target_sample, confirmed, args.output)
+        errors = _convert_nc_to_zarr(args.source, args.target_sample, confirmed, args.output,
+                                     zarr_format=args.zarr_format)
 
     if errors:
         print(f"\nCompleted with {errors} error(s). Output: {args.output}")
@@ -4636,6 +4662,8 @@ if __name__ == "__main__":
     p_convert.add_argument("--mapping", required=True, metavar="FILE",
                            help="Mapping JSON (exported from the Compare tab)")
     p_convert.add_argument("--output", required=True, metavar="FILE", help="Output file path")
+    p_convert.add_argument("--zarr-format", type=int, choices=[2, 3], default=3, metavar="N",
+                           help="Zarr format version for the output when converting to zarr (2 or 3, default: 3)")
 
     args = parser.parse_args()
 

@@ -48,6 +48,7 @@ python zarr_explorer.py compare file_a.zarr file_b.nc --mapping mapping.json --h
 # Convert between zarr and NetCDF using a mapping JSON
 python zarr_explorer.py convert file_a.zarr --target-sample file_b.nc --mapping mapping.json --output output.nc
 python zarr_explorer.py convert file_b.nc --target-sample file_a.zarr --mapping mapping.json --output output.zarr
+python zarr_explorer.py convert file_b.nc --target-sample file_a.zarr --mapping mapping.json --output output.zarr --zarr-format 2
 ```
 
 CLI compare output includes unmatched variables from both files. Defaults to HTML if neither `--html` nor `--csv` is given.
@@ -64,6 +65,8 @@ The conversion direction is detected automatically from the source and target-sa
 3. Written to the output file with the target's structure and encoding
 
 Only confirmed pairs in the mapping are converted. Unmatched or skipped variables produce a warning.
+
+When converting to zarr, `--zarr-format 2` or `--zarr-format 3` (default) controls the output store version.
 
 ## Requirements
 
