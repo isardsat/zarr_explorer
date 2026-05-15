@@ -26,6 +26,7 @@ import webbrowser
 import dash
 import dash_bootstrap_components as dbc
 import numpy as np
+import plotly.colors
 import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.subplots import make_subplots
@@ -980,6 +981,57 @@ _TIME_DIM_PATTERNS = re.compile(
 )
 
 
+def _parse_crop_spec(s: str) -> tuple | None:
+    """Parse a per-pair crop string into a tuple of slices / ints, suitable for
+    array.__getitem__ . Examples:
+        "[:, :256]"   -> (slice(None), slice(None, 256))
+        ":, 5"        -> (slice(None), 5)
+        "[5, :256]"   -> (5, slice(None, 256))
+    Returns None for empty input. Returns None on parse errors (caller falls back)."""
+    if not s or not s.strip():
+        return None
+    body = s.strip()
+    if body.startswith("[") and body.endswith("]"):
+        body = body[1:-1]
+    parts = [p.strip() for p in body.split(",")]
+    out: list = []
+    for p in parts:
+        if not p or p == ":":
+            out.append(slice(None))
+            continue
+        if ":" in p:
+            try:
+                pieces = p.split(":")
+                args = [(_int_or_none(x) if x.strip() else None) for x in pieces]
+                if len(args) == 2:
+                    out.append(slice(args[0], args[1]))
+                elif len(args) == 3:
+                    out.append(slice(args[0], args[1], args[2]))
+                else:
+                    return None
+            except (ValueError, TypeError):
+                return None
+        else:
+            try:
+                out.append(int(p))
+            except ValueError:
+                return None
+    return tuple(out)
+
+
+def _apply_crop_spec(arr: np.ndarray, spec_str: str | None) -> np.ndarray:
+    """Apply a parsed crop spec to an array. No-op on parse failure or empty."""
+    if not spec_str:
+        return arr
+    spec = _parse_crop_spec(spec_str)
+    if spec is None:
+        return arr
+    try:
+        return arr[spec]
+    except (IndexError, TypeError):
+        return arr
+
+
 def _parse_slice(s: str, warn: bool = False) -> slice | None:
     """Parse a slice string like '0:800', '::2', '100:' into a slice object. Returns None if empty."""
     if not s or not s.strip():
@@ -1133,7 +1185,7 @@ def _load_var_data(file_path: str, var_path: str, apply_scale: bool = True,
         if not isinstance(entry, dict) or "data" not in entry:
             raise KeyError(f"other_metadata key not found: {key}")
         try:
-            data = np.array([float(entry["data"])])
+            data = np.array(float(entry["data"]))
         except (ValueError, TypeError):
             raise TypeError(f"Cannot compare non-numeric metadata scalar: {var_path} (value={entry['data']!r})")
         meta_attrs = entry.get("attrs", {})
@@ -1213,6 +1265,16 @@ def _load_var_data(file_path: str, var_path: str, apply_scale: bool = True,
         else:
             raise TypeError(f"Cannot compare non-numeric array: {var_path} (dtype={raw.dtype})")
         attrs = dict(var.attrs)
+        # xarray hides CF-encoded attrs (scale_factor/add_offset/_FillValue)
+        # in var.encoding when mask_and_scale=True. Surface them so the attr
+        # diff against the zarr side (which keeps them in attrs) is fair.
+        for _enc_key in ("scale_factor", "add_offset", "_FillValue",
+                         "missing_value", "dtype"):
+            if _enc_key not in attrs and _enc_key in var.encoding:
+                attrs[_enc_key] = var.encoding[_enc_key]
+        # Mirror zarr's _ARRAY_DIMENSIONS convention using NC dim names.
+        if "_ARRAY_DIMENSIONS" not in attrs:
+            attrs["_ARRAY_DIMENSIONS"] = list(var.dims)
         attrs["_detected_time_axis"] = axis  # propagate for caller
         ds.close()
         data = _apply_time_slice(data, axis, time_slice)
@@ -1259,7 +1321,8 @@ def _parse_tolerance(tol_str: str) -> tuple[str, float]:
 
 def _compare_pair(file_a: str, path_a: str, file_b: str, path_b: str,
                   tolerance: str = "rel:1e-7",
-                  slice_a: slice | None = None, slice_b: slice | None = None) -> dict:
+                  slice_a: slice | None = None, slice_b: slice | None = None,
+                  crop_a: str | None = None, crop_b: str | None = None) -> dict:
     """Compute comparison statistics between two variables."""
     try:
         data_a, attrs_a = _load_var_data(file_a, path_a, time_slice=slice_a)
@@ -1268,6 +1331,10 @@ def _compare_pair(file_a: str, path_a: str, file_b: str, path_b: str,
         # Track if a slice was requested but no time dim was found
         slice_ignored_a = slice_a is not None and attrs_a.get("_detected_time_axis") is None
         slice_ignored_b = slice_b is not None and attrs_b.get("_detected_time_axis") is None
+
+        # Apply per-pair post-load crops (e.g. trim padded zarr trailing dim).
+        data_a = _apply_crop_spec(data_a, crop_a)
+        data_b = _apply_crop_spec(data_b, crop_b)
 
         shape_match = data_a.shape == data_b.shape
         units_a = attrs_a.get("units", "")
@@ -1295,14 +1362,16 @@ def _compare_pair(file_a: str, path_a: str, file_b: str, path_b: str,
                     n_within = 0
                     n_outside = n_total - n_perfect
                 elif tol_mode == "abs":
-                    within_mask = abs_diff <= tol_val
+                    # Small relative epsilon handles FP rounding when decoded values
+                    # land just above the boundary (e.g. large_int * scale_factor)
+                    within_mask = abs_diff <= tol_val * (1.0 + 1e-6)
                     n_within = int(within_mask.sum()) - n_perfect
                     n_outside = n_total - int(within_mask.sum())
                 else:  # rel
                     denom = np.maximum(np.abs(data_a[valid]), np.abs(data_b[valid]))
                     denom = np.where(denom == 0, 1.0, denom)
                     rel_diff = abs_diff / denom
-                    within_mask = rel_diff <= tol_val
+                    within_mask = rel_diff <= tol_val * (1.0 + 1e-6)
                     n_within = int(within_mask.sum()) - n_perfect
                     n_outside = n_total - int(within_mask.sum())
 
@@ -1320,8 +1389,9 @@ def _compare_pair(file_a: str, path_a: str, file_b: str, path_b: str,
             "dtype_a": str(data_a.dtype), "dtype_b": str(data_b.dtype),
             "units_a": units_a, "units_b": units_b,
             "units_match": units_a == units_b,
-            "rmse": round(rmse, 6) if rmse is not None else None,
-            "max_abs_diff": round(max_abs_diff, 6) if max_abs_diff is not None else None,
+            "crop_a": crop_a, "crop_b": crop_b,
+            "rmse": rmse,
+            "max_abs_diff": max_abs_diff,
             "nan_a": nan_a, "nan_b": nan_b, "nan_delta": nan_a - nan_b,
             "tolerance": tolerance,
             "tol_status": tol_status,
@@ -1342,18 +1412,60 @@ def _compare_pair(file_a: str, path_a: str, file_b: str, path_b: str,
         }
 
 
+def _apply_view_slice(data_a: np.ndarray, data_b: np.ndarray,
+                      view_along: str | None, view_index: int | None) -> tuple[np.ndarray, np.ndarray, str]:
+    """Reduce 2D arrays to 1D by fixing the *other* axis at view_index.
+
+    view_along == 'axis0': plot/table varies along axis 0; axis 1 fixed at index.
+    view_along == 'axis1': varies along axis 1; axis 0 fixed at index.
+    Anything else (including 'all') is a no-op.
+    """
+    if view_along not in ("axis0", "axis1"):
+        return data_a, data_b, ""
+    if view_index is None:
+        return data_a, data_b, ""
+    fix_axis = 1 if view_along == "axis0" else 0
+    idx = int(view_index)
+
+    def _take(arr: np.ndarray) -> np.ndarray:
+        if arr.ndim <= fix_axis:
+            return arr  # axis doesn't exist on this side
+        n = arr.shape[fix_axis]
+        if not (0 <= idx < n):
+            return arr
+        return np.take(arr, idx, axis=fix_axis)
+
+    new_a = _take(data_a)
+    new_b = _take(data_b)
+    warn = ""
+    if (new_a.shape == data_a.shape and data_a.ndim > fix_axis and
+            not (0 <= idx < data_a.shape[fix_axis])):
+        warn = f"Index {idx} out of range for axis {fix_axis}; showing full data."
+    return new_a, new_b, warn
+
+
 def _make_compare_figures(
     file_a: str, path_a: str, file_b: str, path_b: str,
     slice_a: slice | None = None, slice_b: slice | None = None,
+    log_scale: bool = False, apply_scale: bool = True,
+    view_along: str | None = None, view_index: int | None = None,
+    crop_a: str | None = None, crop_b: str | None = None,
 ) -> tuple[go.Figure | None, go.Figure | None, go.Figure | None, str]:
     """Generate side-by-side and diff figures for a variable pair. Returns (fig_a, fig_b, fig_diff, warning)."""
     try:
-        data_a, _ = _load_var_data(file_a, path_a, time_slice=slice_a)
-        data_b, _ = _load_var_data(file_b, path_b, time_slice=slice_b)
+        data_a, _ = _load_var_data(file_a, path_a, apply_scale=apply_scale, time_slice=slice_a)
+        data_b, _ = _load_var_data(file_b, path_b, apply_scale=apply_scale, time_slice=slice_b)
     except Exception as exc:
         return None, None, None, str(exc)
 
-    warning = ""
+    # Per-pair post-load crop (e.g. trim padded zarr trailing dim).
+    data_a = _apply_crop_spec(data_a, crop_a)
+    data_b = _apply_crop_spec(data_b, crop_b)
+
+    # Per-detail 1D slice for 2D vars: fix the "other" axis at view_index.
+    data_a, data_b, fix_warn = _apply_view_slice(data_a, data_b, view_along, view_index)
+
+    warning = fix_warn
     label_a = path_a.split("/")[-1]
     label_b = path_b.split("/")[-1]
 
@@ -1368,17 +1480,74 @@ def _make_compare_figures(
     _layout = dict(template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
                    plot_bgcolor="rgba(0,0,0,0)", margin=dict(l=40, r=10, t=35, b=40))
 
+    # Treat shape (N, K) with small K as "K series along N" — render as K
+    # line traces instead of a heatmap (better for position/velocity vectors).
+    _SMALL_DIM = 3
+    use_multiline = (
+        sq_a.ndim == 2 and sq_b.ndim == 2 and sq_a.shape == sq_b.shape
+        and sq_a.shape[-1] <= _SMALL_DIM and sq_a.shape[0] > sq_a.shape[-1]
+    )
+
+    def _expand_constant_range(arrs: list[np.ndarray]) -> tuple[float, float] | None:
+        """If the combined data span is degenerate, return an explicit y-range
+        around the value so plotly doesn't fall back to [-1, 1]."""
+        finite = [a[np.isfinite(a)] for a in arrs if a.size]
+        finite = [a for a in finite if a.size]
+        if not finite:
+            return None
+        all_y = np.concatenate(finite)
+        ymin, ymax = float(np.min(all_y)), float(np.max(all_y))
+        scale = max(abs(ymin), abs(ymax), 1e-30)
+        if (ymax - ymin) > 1e-10 * scale:
+            return None  # plotly's autorange is fine
+        pad = max(scale * 0.05, 1e-30)
+        return ymin - pad, ymax + pad
+
     # ---- Overlay figure ----
     if sq_a.ndim <= 1:
         # 1D: two lines on the same axes
         fig_overlay = go.Figure()
-        ya = _cap(sq_a).ravel()
-        yb = _cap(sq_b).ravel()
+        ya = _cap(sq_a).ravel().astype(float)
+        yb = _cap(sq_b).ravel().astype(float)
         fig_overlay.add_trace(go.Scatter(y=ya.tolist(), mode="lines",
                                          line=dict(width=1.2), name=label_a))
         fig_overlay.add_trace(go.Scatter(y=yb.tolist(), mode="lines",
                                          line=dict(width=1.2, dash="dash"), name=label_b))
-        fig_overlay.update_layout(title=dict(text=f"{label_a}  vs  {label_b}", font=dict(size=11)),
+        fig_overlay.update_layout(title=dict(text="A vs B", font=dict(size=11)),
+                                  showlegend=True, **_layout)
+        if log_scale:
+            fig_overlay.update_yaxes(type="log")
+        else:
+            rng = _expand_constant_range([ya, yb])
+            if rng is not None:
+                fig_overlay.update_yaxes(range=list(rng))
+    elif use_multiline:
+        # 2D with small trailing dim → K subplots side-by-side, each one
+        # showing A vs B (overlaid lines) for that component.
+        n_cols = sq_a.shape[-1]
+        fig_overlay = make_subplots(
+            rows=1, cols=n_cols,
+            subplot_titles=[f"[{k}]" for k in range(n_cols)],
+            horizontal_spacing=0.04)
+        for k in range(n_cols):
+            ya = _cap(sq_a[:, k].astype(float))
+            yb = _cap(sq_b[:, k].astype(float))
+            fig_overlay.add_trace(go.Scatter(
+                y=ya.tolist(), mode="lines", line=dict(width=1.2, color="#1f77b4"),
+                name=label_a, legendgroup="A", showlegend=(k == 0)
+            ), row=1, col=k + 1)
+            fig_overlay.add_trace(go.Scatter(
+                y=yb.tolist(), mode="lines",
+                line=dict(width=1.2, dash="dash", color="#ff7f0e"),
+                name=label_b, legendgroup="B", showlegend=(k == 0)
+            ), row=1, col=k + 1)
+            if log_scale:
+                fig_overlay.update_yaxes(type="log", row=1, col=k + 1)
+            else:
+                rng = _expand_constant_range([ya, yb])
+                if rng is not None:
+                    fig_overlay.update_yaxes(range=list(rng), row=1, col=k + 1)
+        fig_overlay.update_layout(title=dict(text="A vs B", font=dict(size=11)),
                                   showlegend=True, **_layout)
     else:
         # 2D: side-by-side subplots
@@ -1392,6 +1561,9 @@ def _make_compare_figures(
             step_b = max(1, pb.shape[0] * pb.shape[1] // _CMP_SIZE_CAP)
             pb = pb[::step_b, :]
             warning = "Data downsampled for display."
+        if log_scale:
+            pa = np.log10(np.where(pa > 0, pa, np.nan))
+            pb = np.log10(np.where(pb > 0, pb, np.nan))
         fig_overlay = make_subplots(rows=1, cols=2,
                                     subplot_titles=[label_a, label_b],
                                     shared_yaxes=True, horizontal_spacing=0.05)
@@ -1410,6 +1582,20 @@ def _make_compare_figures(
             y = _cap(sq_diff).ravel()
             fig_diff.add_trace(go.Scatter(y=y.tolist(), mode="lines",
                                           line=dict(width=1.2, color="#593196"), name="A − B"))
+        elif use_multiline:
+            # K subplots, one per component, each showing A − B
+            n_cols = sq_diff.shape[-1]
+            fig_diff = make_subplots(
+                rows=1, cols=n_cols,
+                subplot_titles=[f"[{k}]" for k in range(n_cols)],
+                horizontal_spacing=0.04)
+            for k in range(n_cols):
+                yd = _cap(sq_diff[:, k].astype(float))
+                fig_diff.add_trace(go.Scatter(
+                    y=yd.tolist(), mode="lines",
+                    line=dict(width=1.2, color="#593196"),
+                    name="A − B", showlegend=(k == 0)
+                ), row=1, col=k + 1)
         else:
             pd_ = sq_diff.reshape(-1, sq_diff.shape[-1])
             if pd_.size > _CMP_SIZE_CAP:
@@ -1609,7 +1795,10 @@ def _build_compare_layout() -> html.Div:
                     class_name="py-2 px-3"),
             ], class_name="border-0 shadow-sm mb-2"),
 
-            # ---- Detail controls bar (shown when a row is clicked) ----
+            # ---- Detail title bar (title + close X) — rendered by callback ----
+            html.Div(id="cmp-detail-header"),
+
+            # ---- Detail controls bar (Plot/Table toggle, between header and body) ----
             html.Div([
                 dbc.RadioItems(
                     id="cmp-detail-mode",
@@ -1628,11 +1817,61 @@ def _build_compare_layout() -> html.Div:
                     dbc.Label("CF scale", style={"fontSize": "10px", "marginRight": "4px", "marginBottom": 0}),
                     dbc.Switch(id="cmp-apply-scale", value=True, style={"fontSize": "11px"}),
                 ], style={"display": "flex", "alignItems": "center", "marginLeft": "10px"}),
+                html.Span("│", style={"color": "#dee2e6", "margin": "0 10px"},
+                         id="cmp-2d-divider"),
+                # 2D slicing controls — only meaningful for 2D vars.
+                html.Div([
+                    dbc.Label("View along", style={"fontSize": "10px", "marginRight": "6px", "marginBottom": 0}),
+                    dbc.RadioItems(
+                        id="cmp-view-along",
+                        options=[{"label": "all (2D)", "value": "all"},
+                                 {"label": "axis 0", "value": "axis0"},
+                                 {"label": "axis 1", "value": "axis1"}],
+                        value="all", inline=True,
+                        input_class_name="btn-check",
+                        label_class_name="btn btn-outline-secondary btn-sm",
+                        label_checked_class_name="btn btn-secondary btn-sm active",
+                    ),
+                ], style={"display": "flex", "alignItems": "center"},
+                   id="cmp-view-along-wrap"),
+                html.Div([
+                    dbc.Label("at index", style={"fontSize": "10px", "marginLeft": "10px",
+                                                 "marginRight": "4px", "marginBottom": 0}),
+                    dbc.Input(id="cmp-view-index", type="number", min=0, step=1,
+                              value=0, placeholder="k", size="sm",
+                              style={"width": "70px", "fontSize": "11px"}),
+                    html.Small(id="cmp-view-index-hint",
+                               style={"color": "#888", "fontSize": "10px", "marginLeft": "6px"}),
+                ], style={"display": "flex", "alignItems": "center"},
+                   id="cmp-view-index-wrap"),
+                html.Span("│", style={"color": "#dee2e6", "margin": "0 10px"},
+                         id="cmp-table-side-divider"),
+                # Which array the 2D table shows (only relevant for 2D table view).
+                html.Div([
+                    dbc.Label("Table:", style={"fontSize": "10px", "marginRight": "6px", "marginBottom": 0}),
+                    dbc.RadioItems(
+                        id="cmp-table-side",
+                        options=[{"label": "A", "value": "a"},
+                                 {"label": "B", "value": "b"},
+                                 {"label": "A−B", "value": "diff"}],
+                        value="a", inline=True,
+                        input_class_name="btn-check",
+                        label_class_name="btn btn-outline-secondary btn-sm",
+                        label_checked_class_name="btn btn-secondary btn-sm active",
+                    ),
+                ], style={"display": "flex", "alignItems": "center"},
+                   id="cmp-table-side-wrap"),
+                html.Div([
+                    dbc.Label("Full table", style={"fontSize": "10px", "marginLeft": "10px",
+                                                   "marginRight": "4px", "marginBottom": 0}),
+                    dbc.Switch(id="cmp-table-full", value=False, style={"fontSize": "11px"}),
+                ], style={"display": "flex", "alignItems": "center"},
+                   id="cmp-table-full-wrap"),
             ], id="cmp-detail-controls",
                style={"display": "none", "alignItems": "center",
-                      "padding": "8px 0 4px 0", "borderTop": "1px solid #dee2e6", "marginTop": "8px"}),
+                      "padding": "8px 0 4px 0", "flexWrap": "wrap", "gap": "6px"}),
 
-            # ---- Detail panel ----
+            # ---- Detail body (plots / attrs / values) — rendered by callback ----
             html.Div(id="cmp-detail-panel"),
 
         ], fluid=True),
@@ -3541,21 +3780,17 @@ def confirm_all(_n, mapping):
 def save_mapping_edits(table_data, current_mapping):
     if not table_data or not current_mapping:
         return dash.no_update
-    # Update path_b and status from table edits
-    table_by_path_a = {r["path_a"]: r for r in table_data if r.get("path_a")}
-    updated = []
-    for row in current_mapping:
-        key = row.get("path_a", "")
-        if key and key in table_by_path_a:
-            t = table_by_path_a[key]
-            updated.append({
-                **row,
-                "path_b": t.get("path_b", row.get("path_b", "")),
-                "status": t.get("status", row.get("status", "pending")),
-                "tolerance": t.get("tolerance", row.get("tolerance", "rel:1e-7")),
-            })
-        else:
-            updated.append(row)
+    # Match table rows back to the original mapping by the _idx field that
+    # render_unified_table stamped on each row. This handles 1-to-many
+    # mappings (same path_a → multiple path_b entries) correctly.
+    updated = [dict(r) for r in current_mapping]
+    for t in table_data:
+        idx = t.get("_idx")
+        if idx is None or not (0 <= idx < len(updated)):
+            continue
+        updated[idx]["path_b"] = t.get("path_b", updated[idx].get("path_b", ""))
+        updated[idx]["status"] = t.get("status", updated[idx].get("status", "pending"))
+        updated[idx]["tolerance"] = t.get("tolerance", updated[idx].get("tolerance", "rel:1e-7"))
     return updated
 
 
@@ -3580,10 +3815,12 @@ def render_unified_table(mapping, results, filt, vars_b):
     b_path_opts = [{"label": v["path"], "value": v["path"]} for v in (vars_b or [])]
     b_path_opts = [{"label": "— unmatched —", "value": ""}] + b_path_opts
 
-    rows = mapping
+    # Keep original mapping index alongside each row so save_mapping_edits can
+    # update the correct entry even when path_a is duplicated (1-to-many).
+    rows_indexed = list(enumerate(mapping))
     if filt and filt != "all":
-        rows = [r for r in mapping if r.get("status") == filt]
-    if not rows:
+        rows_indexed = [(i, r) for i, r in rows_indexed if r.get("status") == filt]
+    if not rows_indexed:
         return html.Span(f"No rows with status '{filt}'.", className="text-muted small")
 
     def _fmt(v):
@@ -3596,17 +3833,28 @@ def render_unified_table(mapping, results, filt, vars_b):
         return str(v)
 
     table_data = []
-    for r in rows:
+    for idx, r in rows_indexed:
         key = (r.get("path_a", ""), r.get("path_b", ""))
         res = results_by_key.get(key)
+        ca, cb = r.get("crop_a"), r.get("crop_b")
+        if ca and cb:
+            crop_text = f"A: {ca} · B: {cb}"
+        elif ca:
+            crop_text = f"A: {ca}"
+        elif cb:
+            crop_text = f"B: {cb}"
+        else:
+            crop_text = ""
         table_data.append({
+            "_idx": idx,
+            "_inspect": "🔍",
             "path_a": r.get("path_a", ""),
             "shape_a": r.get("shape_a", ""),
             "path_b": r.get("path_b", ""),
             "shape_b": r.get("shape_b", ""),
-            "confidence": r.get("confidence", "none"),
             "status": r.get("status", "pending"),
             "tolerance": r.get("tolerance", ""),
+            "crop": crop_text,
             "shape_match": _fmt(res["shape_match"]) if res else "",
             "units_match": _fmt(res["units_match"]) if res else "",
             "rmse": _fmt(res["rmse"]) if res else "",
@@ -3623,15 +3871,16 @@ def render_unified_table(mapping, results, filt, vars_b):
         id="cmp-unified-table",
         data=table_data,
         columns=[
+            {"name": "ⓘ", "id": "_inspect", "editable": False},
             {"name": "Variable A", "id": "path_a", "editable": False},
             {"name": "Shape A", "id": "shape_a", "editable": False},
             {"name": "Variable B", "id": "path_b", "editable": True,
              "presentation": "dropdown"},
             {"name": "Shape B", "id": "shape_b", "editable": False},
-            {"name": "Confidence", "id": "confidence", "editable": False},
-            {"name": "Status", "id": "status", "editable": True,
+            {"name": "Confirm", "id": "status", "editable": True,
              "presentation": "dropdown"},
             {"name": "Tolerance", "id": "tolerance", "editable": True},
+            {"name": "Crop", "id": "crop", "editable": False},
             {"name": "Shape ✓", "id": "shape_match", "editable": False},
             {"name": "Units ✓", "id": "units_match", "editable": False},
             {"name": "RMSE", "id": "rmse", "editable": False},
@@ -3640,7 +3889,7 @@ def render_unified_table(mapping, results, filt, vars_b):
             {"name": "# perfect", "id": "n_perfect", "editable": False},
             {"name": "# within", "id": "n_within", "editable": False},
             {"name": "# outside", "id": "n_outside", "editable": False},
-            {"name": "Tol. status", "id": "tol_status", "editable": False},
+            {"name": "Status", "id": "tol_status", "editable": False},
             {"name": "Warnings", "id": "warnings", "editable": False},
         ],
         dropdown={
@@ -3657,13 +3906,15 @@ def render_unified_table(mapping, results, filt, vars_b):
         style_cell={"fontFamily": "monospace", "fontSize": "11px",
                     "padding": "4px 8px", "textAlign": "left", "minWidth": "60px"},
         style_cell_conditional=[
+            {"if": {"column_id": "_inspect"}, "width": "32px", "minWidth": "32px",
+             "maxWidth": "32px", "textAlign": "center", "cursor": "pointer"},
             {"if": {"column_id": "path_a"}, "minWidth": "160px", "maxWidth": "280px"},
             {"if": {"column_id": "path_b"}, "minWidth": "160px", "maxWidth": "280px"},
             {"if": {"column_id": "shape_a"}, "minWidth": "70px", "maxWidth": "100px"},
             {"if": {"column_id": "shape_b"}, "minWidth": "70px", "maxWidth": "100px"},
-            {"if": {"column_id": "confidence"}, "minWidth": "80px", "maxWidth": "90px"},
             {"if": {"column_id": "status"}, "minWidth": "90px", "maxWidth": "110px"},
             {"if": {"column_id": "tolerance"}, "minWidth": "90px", "maxWidth": "130px"},
+            {"if": {"column_id": "crop"}, "minWidth": "110px", "maxWidth": "180px"},
             {"if": {"column_id": "shape_match"}, "minWidth": "65px", "maxWidth": "75px",
              "textAlign": "center"},
             {"if": {"column_id": "units_match"}, "minWidth": "65px", "maxWidth": "75px",
@@ -3683,12 +3934,10 @@ def render_unified_table(mapping, results, filt, vars_b):
         ],
         style_header={"fontWeight": "bold", "background": "#f4f0fa", "fontSize": "11px"},
         style_data_conditional=(
-            [{"if": {"filter_query": f'{{confidence}} = "{k}"', "column_id": "confidence"},
-              "color": v, "fontWeight": "700"} for k, v in _CONF_COLORS.items()]
-            + [{"if": {"filter_query": f'{{status}} = "{k}"', "column_id": "status"},
-                "color": v, "fontWeight": "700"} for k, v in _STATUS_COLORS.items()]
+            [{"if": {"filter_query": f'{{status}} = "{k}"', "column_id": "status"},
+              "color": v, "fontWeight": "700"} for k, v in _STATUS_COLORS.items()]
             + [{"if": {"filter_query": '{tol_status} = "perfect"'}, "backgroundColor": "#d1f5e0"},  # green
-               {"if": {"filter_query": '{tol_status} = "within"'}, "backgroundColor": "#fff9c4"},   # yellow
+               {"if": {"filter_query": '{tol_status} = "within"'}, "backgroundColor": "#d6ecff"},   # light blue
                {"if": {"filter_query": '{tol_status} = "outside"'}, "backgroundColor": "#ffe0b2"},  # orange
                {"if": {"filter_query": '{shape_match} = "✗"'}, "backgroundColor": "#ffd0a0"},       # darker orange — shape mismatch
                {"if": {"filter_query": '{warnings} != ""'}, "backgroundColor": "#ffb74d",              # dark orange — error
@@ -3697,7 +3946,7 @@ def render_unified_table(mapping, results, filt, vars_b):
                {"if": {"filter_query": '{tol_status} = "perfect"', "column_id": "tol_status"},
                 "color": "#198754", "fontWeight": "700"},
                {"if": {"filter_query": '{tol_status} = "within"', "column_id": "tol_status"},
-                "color": "#b38600", "fontWeight": "700"},
+                "color": "#0d6efd", "fontWeight": "700"},
                {"if": {"filter_query": '{tol_status} = "outside"', "column_id": "tol_status"},
                 "color": "#dc3545", "fontWeight": "700"},
                {"if": {"row_index": "odd", "filter_query": '{tol_status} = ""'},
@@ -3736,7 +3985,8 @@ def run_comparison(_n, mapping, file_a, file_b, slice_a_str, slice_b_str):
     sl_b = _parse_slice(slice_b_str or "")
     results = [_compare_pair(file_a, r["path_a"], file_b, r["path_b"],
                              tolerance=r.get("tolerance", "rel:1e-7"),
-                             slice_a=sl_a, slice_b=sl_b) for r in confirmed]
+                             slice_a=sl_a, slice_b=sl_b,
+                             crop_a=r.get("crop_a"), crop_b=r.get("crop_b")) for r in confirmed]
     n_ok = sum(1 for r in results if r["error"] is None and r["shape_match"])
     n_err = sum(1 for r in results if r["error"] is not None)
     slice_note = ""
@@ -3746,12 +3996,17 @@ def run_comparison(_n, mapping, file_a, file_b, slice_a_str, slice_b_str):
 
 
 @app.callback(
+    Output("cmp-detail-header", "children"),
     Output("cmp-detail-panel", "children"),
     Output("cmp-detail-controls", "style"),
     Input("cmp-unified-table", "active_cell"),
     Input("cmp-log-scale", "value"),
     Input("cmp-apply-scale", "value"),
     Input("cmp-detail-mode", "value"),
+    Input("cmp-view-along", "value"),
+    Input("cmp-view-index", "value"),
+    Input("cmp-table-side", "value"),
+    Input("cmp-table-full", "value"),
     State("cmp-unified-table", "data"),
     State("cmp-results", "data"),
     State("cmp-file-a-path", "data"),
@@ -3760,28 +4015,40 @@ def run_comparison(_n, mapping, file_a, file_b, slice_a_str, slice_b_str):
     State("cmp-slice-b", "value"),
     prevent_initial_call=True,
 )
-def render_detail_panel(active_cell, log_scale, apply_scale, detail_mode, table_data, results, file_a, file_b,
+def render_detail_panel(active_cell, log_scale, apply_scale, detail_mode,
+                        view_along, view_index, table_side, table_full,
+                        table_data, results, file_a, file_b,
                         slice_a_str, slice_b_str):
     _hide = {"display": "none"}
     _show = {"display": "flex", "alignItems": "center",
-             "padding": "8px 0 4px 0", "borderTop": "1px solid #dee2e6", "marginTop": "8px"}
+             "padding": "8px 0 4px 0"}
     if not active_cell or not results or not table_data:
-        return html.Div(), _hide
+        return html.Div(), html.Div(), _hide
+    # Only the dedicated inspect column triggers details; other cell clicks
+    # (e.g. editing path_b or status) should not change the detail panel.
+    if active_cell.get("column_id") != "_inspect":
+        return dash.no_update, dash.no_update, dash.no_update
     if active_cell["row"] >= len(table_data):
-        return html.Div(), _hide
+        return html.Div(), html.Div(), _hide
     # Look up the clicked row's (path_a, path_b) and find in results
     clicked = table_data[active_cell["row"]]
     key = (clicked.get("path_a", ""), clicked.get("path_b", ""))
     row = next((r for r in results if r["path_a"] == key[0] and r["path_b"] == key[1]), None)
     if row is None:
-        return html.Div(), _hide  # row not yet compared
+        return html.Div(), html.Div(), _hide  # row not yet compared
     if row.get("error"):
-        return dbc.Alert(f"Error for this pair: {row['error']}", color="danger", class_name="mt-2"), _show
+        return html.Div(), dbc.Alert(f"Error for this pair: {row['error']}", color="danger", class_name="mt-2"), _show
 
     sl_a = _parse_slice(slice_a_str or "")
     sl_b = _parse_slice(slice_b_str or "")
+    va = view_along if view_along in ("axis0", "axis1") else None
+    vi = int(view_index) if isinstance(view_index, (int, float)) and view_index is not None else None
     fig_overlay, fig_diff, warn = _make_compare_figures(
-        file_a, row["path_a"], file_b, row["path_b"], slice_a=sl_a, slice_b=sl_b)
+        file_a, row["path_a"], file_b, row["path_b"],
+        slice_a=sl_a, slice_b=sl_b,
+        log_scale=bool(log_scale), apply_scale=bool(apply_scale),
+        view_along=va, view_index=vi,
+        crop_a=row.get("crop_a"), crop_b=row.get("crop_b"))
 
     # Attribute diff table
     try:
@@ -3790,12 +4057,21 @@ def render_detail_panel(active_cell, log_scale, apply_scale, detail_mode, table_
     except Exception:
         attrs_a, attrs_b = {}, {}
 
+    def _attrs_equal(a, b):
+        # Handle numpy arrays / list-like attrs that don't compare with bare ==
+        try:
+            if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+                return bool(np.array_equal(np.asarray(a), np.asarray(b)))
+            return bool(a == b)
+        except (ValueError, TypeError):
+            return False
+
     all_keys = sorted(set(attrs_a) | set(attrs_b))
     attr_rows = [{
         "attr": k,
         "value_a": str(attrs_a.get(k, "—")),
         "value_b": str(attrs_b.get(k, "—")),
-        "match": "✓" if attrs_a.get(k) == attrs_b.get(k) else "✗",
+        "match": "✓" if _attrs_equal(attrs_a.get(k), attrs_b.get(k)) else "✗",
     } for k in all_keys]
 
     label_a = os.path.basename(file_a.rstrip("/\\"))
@@ -3808,61 +4084,140 @@ def render_detail_panel(active_cell, log_scale, apply_scale, detail_mode, table_
         ("NaN A / B", f"{row['nan_a']}  /  {row['nan_b']}"),
         ("Units A / B", f"{row['units_a'] or '—'}  /  {row['units_b'] or '—'}"),
     ]
+    if row.get("crop_a") or row.get("crop_b"):
+        stats_rows.append(
+            ("Crop A / B",
+             f"{row.get('crop_a') or '—'}  /  {row.get('crop_b') or '—'}"))
 
-    # Build data table view (values side-by-side)
+    # Build data table view
+    def _fmtv(v: float, dtype: np.dtype) -> str:
+        if v != v:  # NaN
+            return "NaN"
+        if np.issubdtype(dtype, np.integer):
+            return str(int(v))
+        if dtype == np.float32:
+            return f"{v:.8g}"
+        return f"{v:.15g}"  # float64: full precision
+
     try:
         data_a, _ = _load_var_data(file_a, row["path_a"], apply_scale=bool(apply_scale), time_slice=sl_a)
         data_b, _ = _load_var_data(file_b, row["path_b"], apply_scale=bool(apply_scale), time_slice=sl_b)
+        data_a = _apply_crop_spec(data_a, row.get("crop_a"))
+        data_b = _apply_crop_spec(data_b, row.get("crop_b"))
+        data_a, data_b, _ = _apply_view_slice(data_a, data_b, va, vi)
         if log_scale:
             data_a = np.log10(np.abs(data_a) + 1e-30)
             data_b = np.log10(np.abs(data_b) + 1e-30)
+    except Exception:
+        data_a = data_b = None
+
+    if data_a is None:
+        data_table = html.Span("Data not available.", className="text-muted small")
+    elif data_a.ndim >= 2:
+        # 2D view: rows = leading-dim index, columns = trailing-dim index.
+        # Show whichever side (A / B / A−B) the user selected.
+        side = (table_side or "a").lower()
+        same_shape = (data_b is not None and data_b.shape == data_a.shape)
+        if side == "b" and same_shape:
+            arr = data_b
+        elif side == "diff" and same_shape:
+            arr = data_a - data_b
+        else:
+            arr = data_a
+        if arr.ndim > 2:
+            arr = arr.reshape(arr.shape[0], -1)
+        dtype = arr.dtype
+        full_rows, full_cols = arr.shape
+        _CAP = 50
+        capped = (not bool(table_full)) and (full_rows > _CAP or full_cols > _CAP)
+        if capped:
+            disp = arr[:_CAP, :_CAP]
+        else:
+            disp = arr
+        n_rows, n_cols = disp.shape
+        columns = [{"name": "row", "id": "idx"}] + [
+            {"name": f"[{j}]", "id": f"c{j}"} for j in range(n_cols)
+        ]
+        rows_data = []
+        for i in range(n_rows):
+            rec = {"idx": str(i)}
+            for j in range(n_cols):
+                rec[f"c{j}"] = _fmtv(float(disp[i, j]), dtype)
+            rows_data.append(rec)
+        side_label = {"a": "A", "b": "B", "diff": "A − B"}.get(side, "A")
+        note = f"Showing {side_label}  ·  shape {(full_rows, full_cols)}"
+        if capped:
+            note += f"  ·  capped to {n_rows}×{n_cols} (toggle 'Full table' to show all)"
+        data_table = html.Div([
+            html.Small(note, className="text-muted",
+                       style={"fontSize": "10px", "display": "block", "marginBottom": "4px"}),
+            dash_table.DataTable(
+                data=rows_data,
+                columns=columns,
+                style_table={"overflowX": "auto", "overflowY": "auto", "maxHeight": "420px"},
+                style_cell={"fontFamily": "monospace", "fontSize": "11px",
+                            "padding": "2px 6px", "minWidth": "70px"},
+                style_header={"fontWeight": "bold", "background": "#f4f0fa",
+                              "fontSize": "11px", "position": "sticky", "top": 0},
+                style_data_conditional=[{"if": {"row_index": "odd"}, "backgroundColor": "#fafafa"}],
+                page_action="none",
+            ),
+        ])
+    else:
+        # 1D view: A | B | A−B per row.
         flat_a = data_a.ravel()
-        flat_b = data_b.ravel() if data_b.shape == data_a.shape else None
-        _MAX_ROWS = 500
-        data_table_rows = []
+        flat_b = data_b.ravel() if (data_b is not None and data_b.shape == data_a.shape) else None
         dtype_a = data_a.dtype
-        def _fmtv(v: float, dtype: np.dtype) -> str:
-            if v != v:  # NaN
-                return "NaN"
-            if np.issubdtype(dtype, np.integer):
-                return str(int(v))
-            if dtype == np.float32:
-                return f"{v:.8g}"
-            return f"{v:.15g}"  # float64: full precision
-        for i in range(min(len(flat_a), _MAX_ROWS)):
+        rows_data = []
+        for i in range(len(flat_a)):
             va = float(flat_a[i])
             vb = float(flat_b[i]) if flat_b is not None else None
             diff = (va - vb) if (vb is not None and not (va != va or vb != vb)) else None
-            data_table_rows.append({
+            rows_data.append({
                 "idx": str(i),
                 "val_a": _fmtv(va, dtype_a),
                 "val_b": _fmtv(vb, dtype_a) if vb is not None else "—",
                 "diff": f"{diff:.6g}" if diff is not None else "—",
             })
-    except Exception:
-        data_table_rows = []
+        data_table = dash_table.DataTable(
+            data=rows_data,
+            columns=[
+                {"name": "Index", "id": "idx"},
+                {"name": f"A: {row['path_a']}", "id": "val_a"},
+                {"name": f"B: {row['path_b']}", "id": "val_b"},
+                {"name": "A − B", "id": "diff"},
+            ],
+            style_table={"overflowX": "auto", "overflowY": "auto", "maxHeight": "420px"},
+            style_cell={"fontFamily": "monospace", "fontSize": "11px", "padding": "3px 8px"},
+            style_header={"fontWeight": "bold", "background": "#f4f0fa",
+                          "fontSize": "11px", "position": "sticky", "top": 0},
+            style_data_conditional=[{"if": {"row_index": "odd"}, "backgroundColor": "#fafafa"}],
+            page_action="none",
+        ) if rows_data else html.Span("Data not available.", className="text-muted small")
 
-    data_table = dash_table.DataTable(
-        data=data_table_rows,
-        columns=[
-            {"name": "Index", "id": "idx"},
-            {"name": f"A: {row['path_a']}", "id": "val_a"},
-            {"name": f"B: {row['path_b']}", "id": "val_b"},
-            {"name": "A − B", "id": "diff"},
-        ],
-        style_table={"overflowX": "auto", "overflowY": "auto", "maxHeight": "320px"},
-        style_cell={"fontFamily": "monospace", "fontSize": "11px", "padding": "3px 8px"},
-        style_header={"fontWeight": "bold", "background": "#f4f0fa", "fontSize": "11px"},
-        style_data_conditional=[{"if": {"row_index": "odd"}, "backgroundColor": "#fafafa"}],
-        page_action="none",
-        fixed_rows={"headers": True},
-    ) if data_table_rows else html.Span("Data not available.", className="text-muted small")
+    header = dbc.Card(
+        dbc.CardHeader(
+            html.Div([
+                html.Small(
+                    f"Detail: {row['path_a']}     vs     {row['path_b']}",
+                    className="fw-semibold text-muted",
+                    style={"whiteSpace": "pre"},
+                ),
+                html.Button(
+                    "×",
+                    id="cmp-detail-close-btn",
+                    style={"background": "none", "border": "none",
+                           "fontSize": "20px", "lineHeight": "1",
+                           "padding": "0 4px", "marginLeft": "auto",
+                           "cursor": "pointer", "color": "#888"},
+                    title="Close inspection panel",
+                ),
+            ], style={"display": "flex", "alignItems": "center"}),
+        ),
+        class_name="border-0 shadow-sm mt-2 mb-0",
+    )
 
-    return dbc.Card([
-        dbc.CardHeader(html.Small(
-            f"Detail: {row['path_a']}  vs  {row['path_b']}",
-            className="fw-semibold text-muted",
-        )),
+    body = dbc.Card(
         dbc.CardBody([
             html.Div([
                 html.Span([
@@ -3882,36 +4237,126 @@ def render_detail_panel(active_cell, log_scale, apply_scale, detail_mode, table_
                                       config={"displaylogo": False}) if fig_diff else html.Div(),
                             width=5),
                 ], class_name="g-1 mb-2"),
-                html.Div([
-                    html.Small(f"A = {label_a} / {row['path_a']}",
-                               style={"color": "#888", "fontFamily": "monospace", "fontSize": "10px"}),
-                    html.Br(),
-                    html.Small(f"B = {label_b} / {row['path_b']}",
-                               style={"color": "#888", "fontFamily": "monospace", "fontSize": "10px"}),
-                ], className="mb-2"),
                 dash_table.DataTable(
+                    id="cmp-attr-table",
                     data=attr_rows,
                     columns=[
                         {"name": "Attribute", "id": "attr"},
-                        {"name": f"A ({label_a})", "id": "value_a"},
-                        {"name": f"B ({label_b})", "id": "value_b"},
+                        {"name": "A", "id": "value_a"},
+                        {"name": "B", "id": "value_b"},
                         {"name": "Match", "id": "match"},
                     ],
-                    style_table={"overflowX": "auto", "maxHeight": "200px", "overflowY": "auto"},
-                    style_cell={"fontFamily": "monospace", "fontSize": "10px", "padding": "3px 6px"},
-                    style_header={"fontWeight": "bold", "background": "#f4f0fa", "fontSize": "10px"},
+                    style_table={"width": "100%", "maxHeight": "320px",
+                                 "overflowX": "hidden", "overflowY": "auto"},
+                    style_cell={"fontFamily": "monospace", "fontSize": "10px",
+                                "padding": "3px 6px",
+                                "whiteSpace": "normal", "height": "auto",
+                                "wordBreak": "break-word", "verticalAlign": "top",
+                                "textAlign": "left"},
+                    style_cell_conditional=[
+                        {"if": {"column_id": "attr"}, "width": "15%"},
+                        {"if": {"column_id": "value_a"}, "width": "40%"},
+                        {"if": {"column_id": "value_b"}, "width": "40%"},
+                        {"if": {"column_id": "match"}, "width": "5%", "textAlign": "center"},
+                    ],
+                    style_header={"fontWeight": "bold", "background": "#f4f0fa", "fontSize": "10px",
+                                  "whiteSpace": "normal", "height": "auto"},
                     style_data_conditional=[
                         {"if": {"filter_query": '{match} = "✗"'}, "backgroundColor": "#fff3cd"},
                         {"if": {"row_index": "odd"}, "backgroundColor": "#fafafa"},
                     ],
                     page_action="none",
-                    fixed_rows={"headers": True},
+                    fill_width=True,
                 ) if attr_rows else html.Span("No attributes.", className="text-muted small"),
             ], id="cmp-detail-plot-view", style={"display": "" if detail_mode == "plot" else "none"}),
             # Table view
             html.Div(data_table, id="cmp-detail-table-view", style={"display": "" if detail_mode == "table" else "none"}),
         ], class_name="py-2 px-3"),
-    ], class_name="border-0 shadow-sm mt-2"), _show
+        class_name="border-0 shadow-sm mt-0",
+    )
+
+    return header, body, _show
+
+
+@app.callback(
+    Output("cmp-unified-table", "active_cell"),
+    Input("cmp-detail-close-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def close_detail_panel(n):
+    # The button is recreated on every detail render; ignore the spurious
+    # n_clicks=None/0 trigger that fires when the button first mounts.
+    if not n:
+        return dash.no_update
+    return None
+
+
+@app.callback(
+    Output("cmp-view-index", "max"),
+    Output("cmp-view-index-hint", "children"),
+    Output("cmp-view-along-wrap", "style"),
+    Output("cmp-view-index-wrap", "style"),
+    Output("cmp-2d-divider", "style"),
+    Output("cmp-table-side-wrap", "style"),
+    Output("cmp-table-full-wrap", "style"),
+    Output("cmp-table-side-divider", "style"),
+    Input("cmp-unified-table", "active_cell"),
+    Input("cmp-view-along", "value"),
+    Input("cmp-detail-mode", "value"),
+    State("cmp-unified-table", "data"),
+    State("cmp-results", "data"),
+    State("cmp-file-a-path", "data"),
+    State("cmp-slice-a", "value"),
+    prevent_initial_call=True,
+)
+def update_2d_controls_visibility(active_cell, view_along, detail_mode,
+                                  table_data, results, file_a, slice_a_str):
+    """Show fix-axis / table-side controls only for 2D variables."""
+    flex = {"display": "flex", "alignItems": "center"}
+    inline = {"color": "#dee2e6", "margin": "0 10px"}
+    hidden = {"display": "none"}
+    no = dash.no_update
+
+    if not active_cell or active_cell.get("column_id") != "_inspect" or not table_data:
+        return no, no, hidden, hidden, hidden, hidden, hidden, hidden
+    if active_cell["row"] >= len(table_data):
+        return no, no, hidden, hidden, hidden, hidden, hidden, hidden
+
+    clicked = table_data[active_cell["row"]]
+    path_a = clicked.get("path_a", "")
+    if not file_a or not path_a:
+        return no, no, hidden, hidden, hidden, hidden, hidden, hidden
+
+    # Load A only to determine shape (cheap shape probe).
+    try:
+        sl_a = _parse_slice(slice_a_str or "")
+        data_a, _ = _load_var_data(file_a, path_a, apply_scale=True, time_slice=sl_a)
+    except Exception:
+        return no, no, hidden, hidden, hidden, hidden, hidden, hidden
+
+    is_2d = data_a.ndim >= 2
+    if not is_2d:
+        return no, no, hidden, hidden, hidden, hidden, hidden, hidden
+
+    # 2D variable — show the View along / index controls.
+    if view_along == "axis0":
+        # fixing axis 1 — index ranges 0..shape[1]-1
+        max_idx = data_a.shape[1] - 1
+        hint = f"of {data_a.shape[1]} (axis 1)"
+    elif view_along == "axis1":
+        max_idx = data_a.shape[0] - 1
+        hint = f"of {data_a.shape[0]} (axis 0)"
+    else:
+        max_idx = max(data_a.shape) - 1
+        hint = ""
+
+    # Table side / full only relevant in 2D table mode AND when no axis is fixed.
+    in_2d_table = (detail_mode == "table") and (view_along not in ("axis0", "axis1"))
+    table_side_style = flex if in_2d_table else hidden
+    table_full_style = flex if in_2d_table else hidden
+    table_side_div = inline if in_2d_table else hidden
+
+    return max_idx, hint, flex, flex, inline, table_side_style, table_full_style, table_side_div
 
 
 @app.callback(
@@ -4112,11 +4557,16 @@ def export_mapping(_n, mapping, slice_a, slice_b):
     if not mapping:
         return dash.no_update
     import json as _json
-    minimal = [
-        {"path_a": r.get("path_a", ""), "path_b": r.get("path_b", ""),
-         "status": r.get("status", "pending"), "tolerance": r.get("tolerance", "rel:1e-7")}
-        for r in mapping
-    ]
+    def _row(r):
+        base = {"path_a": r.get("path_a", ""), "path_b": r.get("path_b", ""),
+                "status": r.get("status", "pending"),
+                "tolerance": r.get("tolerance", "rel:1e-7")}
+        if r.get("crop_a"):
+            base["crop_a"] = r["crop_a"]
+        if r.get("crop_b"):
+            base["crop_b"] = r["crop_b"]
+        return base
+    minimal = [_row(r) for r in mapping]
     payload = {"version": "2", "mapping": minimal,
                "slice_a": slice_a or "", "slice_b": slice_b or ""}
     filename = f"variable_mapping_{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
@@ -4162,7 +4612,7 @@ def import_mapping(contents, vars_a, vars_b):
         or (r.get("path_b") and r["path_b"] not in b_paths)
     )
     status = f"Loaded {len(mapping)} rows." + (f" {missing} paths not found in current files." if missing else "")
-    return mapping, status, slice_a or no, slice_b or no
+    return mapping, status, slice_a, slice_b
 
 
 # ---------------------------------------------------------------------------
@@ -4255,7 +4705,8 @@ def _cli_compare(args: "argparse.Namespace") -> None:
     sl_a = _parse_slice(slice_a_str, warn=True)
     sl_b = _parse_slice(slice_b_str, warn=True)
 
-    confirmed = [r for r in mapping if r.get("status") == "confirmed" and r.get("path_b")]
+    confirmed = [r for r in mapping if r.get("status") == "confirmed"
+                 and r.get("path_a") and r.get("path_b")]
     if not confirmed:
         print("No confirmed pairs in mapping — nothing to compare.", file=sys.stderr)
         sys.exit(1)
@@ -4265,7 +4716,8 @@ def _cli_compare(args: "argparse.Namespace") -> None:
     for i, row in enumerate(confirmed, 1):
         tol = row.get("tolerance", "rel:1e-7") or "rel:1e-7"
         r = _compare_pair(args.file_a, row["path_a"], args.file_b, row["path_b"],
-                          tolerance=tol, slice_a=sl_a, slice_b=sl_b)
+                          tolerance=tol, slice_a=sl_a, slice_b=sl_b,
+                          crop_a=row.get("crop_a"), crop_b=row.get("crop_b"))
         results.append(r)
         status = r.get("tol_status", "—")
         warn = _build_warnings(r)
