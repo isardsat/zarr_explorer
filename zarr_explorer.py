@@ -1627,6 +1627,64 @@ _STATUS_COLORS = {
 }
 
 
+def _apply_compare_filter(rows_indexed, filt, results_by_key):
+    """Filter mapping rows by either mapping status or result classification.
+
+    Mapping-status filters: 'pending', 'confirmed' read row['status'].
+    Result filters: 'perfect', 'within', 'outside' read result['tol_status'];
+    'nan' selects rows whose comparison saw a non-zero NaN-count delta.
+    """
+    if filt in ("pending", "confirmed"):
+        return [(i, r) for i, r in rows_indexed if r.get("status") == filt]
+
+    if filt in ("perfect", "within", "outside"):
+        keep = []
+        for i, r in rows_indexed:
+            res = results_by_key.get((r.get("path_a", ""), r.get("path_b", "")))
+            if res and res.get("tol_status") == filt:
+                keep.append((i, r))
+        return keep
+
+    if filt == "nan":
+        keep = []
+        for i, r in rows_indexed:
+            res = results_by_key.get((r.get("path_a", ""), r.get("path_b", "")))
+            nd = res.get("nan_delta") if res else None
+            if isinstance(nd, (int, float)) and nd != 0:
+                keep.append((i, r))
+        return keep
+
+    return rows_indexed
+
+
+def _cmp_filter_chips() -> html.Div:
+    """Three filter groups separated by │; sync callback keeps one selected.
+
+    g1 = All; g2 = mapping status (Pending/Confirmed);
+    g3 = result status (Perfect/Within/Outside/NaN).
+    """
+    common = dict(inline=True, style={"fontSize": "11px"},
+                  input_class_name="me-1", label_class_name="me-2")
+    g1 = dbc.RadioItems(id="cmp-filter-g1",
+                        options=[{"label": "All", "value": "all"}],
+                        value="all", **common)
+    g2 = dbc.RadioItems(id="cmp-filter-g2",
+                        options=[{"label": x, "value": x.lower()}
+                                 for x in ["Pending", "Confirmed"]],
+                        **common)
+    g3 = dbc.RadioItems(id="cmp-filter-g3",
+                        options=[{"label": x, "value": x.lower()}
+                                 for x in ["Perfect", "Within", "Outside", "NaN"]],
+                        **common)
+    sep = lambda: html.Span("│", style={
+        "color": "#dee2e6", "margin": "0 10px",
+        "lineHeight": "1", "transform": "translateY(-1px)",
+        "display": "inline-block",
+    })
+    return html.Div([g1, sep(), g2, sep(), g3],
+                    style={"display": "flex", "alignItems": "center"})
+
+
 def _build_compare_layout() -> html.Div:
     """Build the Compare Files tab layout."""
     return html.Div([
@@ -1717,30 +1775,86 @@ def _build_compare_layout() -> html.Div:
             ], class_name="border-0 shadow-sm mb-2 mt-2"),
 
             # ---- Unified mapping + results table ----
+            # Single-row header: left = mapping actions, right = run + export.
+            # Sub-row beneath the divider holds filter chips and run status.
             dbc.Card([
-                dbc.CardHeader(html.Div([
-                    html.Small("Variables", className="fw-semibold text-muted me-3"),
-                    dbc.Button("Auto-match", id="cmp-automatch-btn", color="primary",
-                               size="sm", style={"fontSize": "11px"}),
-                    dbc.Button("Confirm high confidence", id="cmp-bulk-confirm-btn",
-                               color="success", size="sm", outline=True, disabled=True,
-                               style={"fontSize": "11px", "marginLeft": "6px"}),
-                    dbc.Button("Confirm all", id="cmp-confirm-all-btn",
-                               color="success", size="sm", disabled=True,
-                               style={"fontSize": "11px", "marginLeft": "6px"}),
-                    dbc.RadioItems(
-                        id="cmp-mapping-filter",
-                        options=[
-                            {"label": "All", "value": "all"},
-                            {"label": "Pending", "value": "pending"},
-                            {"label": "Confirmed", "value": "confirmed"},
-                            {"label": "Skipped", "value": "skipped"},
-                        ],
-                        value="all", inline=True,
-                        style={"fontSize": "11px", "marginLeft": "16px"},
-                        input_class_name="me-1", label_class_name="me-2",
-                    ),
-                ], style={"display": "flex", "alignItems": "center", "flexWrap": "wrap", "gap": "4px"})),
+                dbc.CardHeader([
+                    # Primary action row
+                    html.Div([
+                        # Left: mapping actions
+                        html.Div([
+                            dbc.Button("Auto-match", id="cmp-automatch-btn", color="primary",
+                                       size="sm", style={"fontSize": "11px"}),
+                            dbc.Button("Confirm all", id="cmp-confirm-all-btn",
+                                       color="success", outline=True, size="sm", disabled=True,
+                                       style={"fontSize": "11px", "marginLeft": "4px"}),
+                            html.Span("│", style={"color": "#dee2e6", "margin": "0 8px"}),
+                            dcc.Upload(
+                                id="cmp-import-mapping-upload",
+                                children=dbc.Button(
+                                    [html.I(className="bi bi-upload me-1"), "Import mapping"],
+                                    color="link", size="sm",
+                                    style={"fontSize": "11px", "padding": "0"},
+                                ),
+                                accept=".json",
+                                multiple=False,
+                                style={"display": "inline-flex", "alignItems": "center"},
+                            ),
+                            dbc.Button(
+                                [html.I(className="bi bi-download me-1"), "Export mapping"],
+                                id="cmp-export-mapping-btn", color="link", size="sm",
+                                style={"fontSize": "11px", "padding": "0", "marginLeft": "8px"},
+                            ),
+                            html.Span(id="cmp-import-status", className="text-muted",
+                                      style={"fontSize": "10px", "marginLeft": "6px"}),
+                        ], style={"display": "flex", "alignItems": "center"}),
+
+                        # Right: run config + result downloads
+                        html.Div([
+                            dbc.Label("A slice", className="text-muted me-1",
+                                      style={"fontSize": "11px", "marginBottom": 0, "whiteSpace": "nowrap"}),
+                            dbc.Input(id="cmp-slice-a", placeholder="e.g. 0:800", size="sm",
+                                      debounce=True, style={"width": "110px", "fontSize": "11px"}),
+                            html.Span("", style={"width": "8px"}),
+                            dbc.Label("B slice", className="text-muted me-1",
+                                      style={"fontSize": "11px", "marginBottom": 0, "whiteSpace": "nowrap"}),
+                            dbc.Input(id="cmp-slice-b", placeholder="e.g. 0:800", size="sm",
+                                      debounce=True, style={"width": "110px", "fontSize": "11px"}),
+                            dbc.Button(
+                                [html.I(className="bi bi-play-fill me-1"), "Run comparison"],
+                                id="cmp-run-btn", color="primary", size="sm",
+                                style={"fontSize": "11px", "marginLeft": "12px"},
+                            ),
+                            html.Span("│", style={"color": "#dee2e6", "margin": "0 8px"}),
+                            dbc.Button(
+                                [html.I(className="bi bi-filetype-html me-1"), "HTML"],
+                                id="cmp-report-btn", color="link", size="sm", disabled=True,
+                                style={"fontSize": "11px", "padding": "0"},
+                            ),
+                            dbc.Button(
+                                [html.I(className="bi bi-filetype-csv me-1"), "CSV"],
+                                id="cmp-csv-btn", color="link", size="sm", disabled=True,
+                                style={"fontSize": "11px", "padding": "0", "marginLeft": "6px"},
+                            ),
+                        ], style={"display": "flex", "alignItems": "center",
+                                  "marginLeft": "auto", "gap": "4px"}),
+                    ], style={"display": "flex", "alignItems": "center",
+                              "flexWrap": "wrap", "gap": "6px"}),
+
+                    # Sub-row: filter chips + run status
+                    html.Div([
+                        _cmp_filter_chips(),
+                        dcc.Loading(
+                            html.Span(id="cmp-run-status", className="text-muted",
+                                      style={"fontSize": "11px", "lineHeight": "1"}),
+                            type="circle", color="#0d6efd", delay_show=200,
+                            parent_style={"marginLeft": "auto", "display": "inline-flex",
+                                          "alignItems": "center"},
+                        ),
+                    ], style={"display": "flex", "alignItems": "center",
+                              "marginTop": "6px", "paddingTop": "6px",
+                              "borderTop": "1px dashed #e9ecef"}),
+                ]),
                 dbc.CardBody(
                     dcc.Loading(
                         html.Div(id="cmp-mapping-area",
@@ -1750,49 +1864,6 @@ def _build_compare_layout() -> html.Div:
                     ),
                     class_name="p-2",
                 ),
-                dbc.CardFooter(html.Div([
-                    dbc.Button("Run Comparison", id="cmp-run-btn", color="primary", size="sm"),
-                    html.Div([
-                        dbc.Label("A time slice:", className="text-muted me-1",
-                                  style={"fontSize": "11px", "marginBottom": 0, "whiteSpace": "nowrap"}),
-                        dbc.Input(id="cmp-slice-a", placeholder="e.g. 0:800 or ::2", size="sm",
-                                  debounce=True, style={"width": "120px", "fontSize": "11px"}),
-                    ], style={"display": "flex", "alignItems": "center", "gap": "4px", "marginLeft": "12px"}),
-                    html.Div([
-                        dbc.Label("B time slice:", className="text-muted me-1",
-                                  style={"fontSize": "11px", "marginBottom": 0, "whiteSpace": "nowrap"}),
-                        dbc.Input(id="cmp-slice-b", placeholder="e.g. 0:800 or ::2", size="sm",
-                                  debounce=True, style={"width": "120px", "fontSize": "11px"}),
-                    ], style={"display": "flex", "alignItems": "center", "gap": "4px", "marginLeft": "8px"}),
-                    dcc.Loading(
-                        html.Span(id="cmp-run-status", className="text-muted small ms-3",
-                                  style={"fontSize": "11px"}),
-                        type="circle", color="#0d6efd", delay_show=200,
-                        style={"marginLeft": "8px"},
-                    ),
-                    html.Span("│", style={"color": "#dee2e6", "margin": "0 8px"}),
-                    dbc.Button("Export mapping", id="cmp-export-mapping-btn",
-                               color="link", size="sm",
-                               style={"fontSize": "11px", "padding": "0"}),
-                    dcc.Upload(
-                        id="cmp-import-mapping-upload",
-                        children=dbc.Button("Import mapping", color="link", size="sm",
-                                            style={"fontSize": "11px", "padding": "0"}),
-                        accept=".json",
-                        multiple=False,
-                        style={"display": "inline-flex", "alignItems": "center",
-                               "marginLeft": "8px"},
-                    ),
-                    html.Span(id="cmp-import-status", className="text-muted",
-                              style={"fontSize": "10px", "marginLeft": "6px"}),
-                    dbc.Button("Download HTML Report", id="cmp-report-btn",
-                               color="link", size="sm",
-                               style={"fontSize": "11px", "padding": "0", "marginLeft": "auto"}),
-                    dbc.Button("Download CSV", id="cmp-csv-btn",
-                               color="link", size="sm",
-                               style={"fontSize": "11px", "padding": "0", "marginLeft": "8px"}),
-                ], style={"display": "flex", "alignItems": "center", "flexWrap": "wrap"}),
-                    class_name="py-2 px-3"),
             ], class_name="border-0 shadow-sm mb-2"),
 
             # ---- Detail title bar (title + close X) — rendered by callback ----
@@ -1872,7 +1943,10 @@ def _build_compare_layout() -> html.Div:
                       "padding": "8px 0 4px 0", "flexWrap": "wrap", "gap": "6px"}),
 
             # ---- Detail body (plots / attrs / values) — rendered by callback ----
-            html.Div(id="cmp-detail-panel"),
+            dcc.Loading(
+                html.Div(id="cmp-detail-panel"),
+                type="circle", color="#0d6efd", delay_show=200,
+            ),
 
         ], fluid=True),
     ])
@@ -2587,6 +2661,13 @@ app.index_string = app.index_string.replace(
 .tooltip-inner { max-width: 500px !important; }
 /* Align dcc.Upload wrapper with sibling flex items */
 #cmp-import-mapping-upload { display: inline-flex !important; align-items: center !important; line-height: 1 !important; }
+/* Match detail-control button font-size to other sm buttons (Auto-match, Run). */
+#cmp-detail-controls label.btn { font-size: 11px !important; }
+/* Suppress Dash's default red active-cell outline on the compare table.
+   Style_data_conditional still paints editable columns blue when active. */
+#cmp-unified-table td.focused,
+#cmp-unified-table td.cell--selected,
+#cmp-unified-table td.dash-cell--selected { box-shadow: none !important; outline: none !important; }
 </style></head>""",
 )
 def _serve_layout():
@@ -3731,31 +3812,11 @@ def auto_match(_n, vars_a, vars_b):
 
 
 @app.callback(
-    Output("cmp-bulk-confirm-btn", "disabled"),
     Output("cmp-confirm-all-btn", "disabled"),
     Input("cmp-mapping", "data"),
 )
 def toggle_confirm_buttons(mapping):
-    disabled = not bool(mapping)
-    return disabled, disabled
-
-
-@app.callback(
-    Output("cmp-mapping", "data", allow_duplicate=True),
-    Input("cmp-bulk-confirm-btn", "n_clicks"),
-    State("cmp-mapping", "data"),
-    prevent_initial_call=True,
-)
-def bulk_confirm_high(_n, mapping):
-    if not mapping:
-        return dash.no_update
-    updated = []
-    for row in mapping:
-        if row.get("confidence") == "high" and row.get("path_a") and row.get("path_b"):
-            updated.append({**row, "status": "confirmed"})
-        else:
-            updated.append(row)
-    return updated
+    return not bool(mapping)
 
 
 @app.callback(
@@ -3795,16 +3856,51 @@ def save_mapping_edits(table_data, current_mapping):
 
 
 @app.callback(
+    Output("cmp-filter-g1", "value"),
+    Output("cmp-filter-g2", "value"),
+    Output("cmp-filter-g3", "value"),
+    Input("cmp-filter-g1", "value"),
+    Input("cmp-filter-g2", "value"),
+    Input("cmp-filter-g3", "value"),
+    prevent_initial_call=True,
+)
+def sync_compare_filter_chips(v1, v2, v3):
+    """Filter chips are split into three RadioItems groups separated by │.
+    Clicking any chip clears the other two groups so only one stays selected."""
+    trig = ctx.triggered_id
+    if trig == "cmp-filter-g1":
+        return v1, None, None
+    if trig == "cmp-filter-g2":
+        return None, v2, None
+    return None, None, v3
+
+
+@app.callback(
+    Output("cmp-report-btn", "disabled"),
+    Output("cmp-csv-btn", "disabled"),
+    Input("cmp-results", "data"),
+)
+def toggle_download_buttons(results):
+    return (not bool(results)), (not bool(results))
+
+
+@app.callback(
     Output("cmp-mapping-area", "children"),
     Input("cmp-mapping", "data"),
     Input("cmp-results", "data"),
-    Input("cmp-mapping-filter", "value"),
+    Input("cmp-filter-g1", "value"),
+    Input("cmp-filter-g2", "value"),
+    Input("cmp-filter-g3", "value"),
     State("cmp-file-b-vars", "data"),
     prevent_initial_call=True,
 )
-def render_unified_table(mapping, results, filt, vars_b):
+def render_unified_table(mapping, results, g1, g2, g3, vars_b):
     if not mapping:
         return html.Span("Load both files and click Auto-match.", className="text-muted small")
+
+    # The three filter groups are mutually exclusive (sync callback enforces it),
+    # so the active filter is whichever group currently has a value set.
+    filt = g1 or g2 or g3 or "all"
 
     # Build results lookup by (path_a, path_b)
     results_by_key: dict = {}
@@ -3819,7 +3915,7 @@ def render_unified_table(mapping, results, filt, vars_b):
     # update the correct entry even when path_a is duplicated (1-to-many).
     rows_indexed = list(enumerate(mapping))
     if filt and filt != "all":
-        rows_indexed = [(i, r) for i, r in rows_indexed if r.get("status") == filt]
+        rows_indexed = _apply_compare_filter(rows_indexed, filt, results_by_key)
     if not rows_indexed:
         return html.Span(f"No rows with status '{filt}'.", className="text-muted small")
 
@@ -3951,6 +4047,12 @@ def render_unified_table(mapping, results, filt, vars_b):
                 "color": "#dc3545", "fontWeight": "700"},
                {"if": {"row_index": "odd", "filter_query": '{tol_status} = ""'},
                 "backgroundColor": "#fafafa"},
+               # Suppress Dash's default red active-cell outline for non-editable
+               # columns; the column-specific blue rules below win for path_b/status/tolerance.
+               {"if": {"state": "active"},
+                "backgroundColor": "transparent", "border": "1px solid #dee2e6"},
+               {"if": {"state": "selected"},
+                "backgroundColor": "transparent", "border": "1px solid #dee2e6"},
                {"if": {"state": "active", "column_id": "path_b"},
                 "backgroundColor": "#e3f2fd", "border": "1px solid #90caf9"},
                {"if": {"state": "active", "column_id": "status"},
@@ -4580,15 +4682,18 @@ def export_mapping(_n, mapping, slice_a, slice_b):
     Output("cmp-import-status", "children"),
     Output("cmp-slice-a", "value"),
     Output("cmp-slice-b", "value"),
+    Output("cmp-import-mapping-upload", "contents"),
     Input("cmp-import-mapping-upload", "contents"),
     State("cmp-file-a-vars", "data"),
     State("cmp-file-b-vars", "data"),
     prevent_initial_call=True,
 )
 def import_mapping(contents, vars_a, vars_b):
+    # Reset `contents` to None after each run so re-uploading the same file
+    # (e.g. import → auto-match → import again) fires the callback again.
     no = dash.no_update
     if not contents:
-        return no, "", no, no
+        return no, "", no, no, None
     import json as _json
     import base64 as _b64
     try:
@@ -4596,9 +4701,9 @@ def import_mapping(contents, vars_a, vars_b):
         payload = _json.loads(_b64.b64decode(_data).decode("utf-8"))
         mapping = payload.get("mapping") if isinstance(payload, dict) else payload
         if not isinstance(mapping, list):
-            return no, "Invalid file.", no, no
+            return no, "Invalid file.", no, no, None
     except Exception as exc:
-        return no, f"Error: {exc}", no, no
+        return no, f"Error: {exc}", no, no, None
 
     slice_a = payload.get("slice_a", "") if isinstance(payload, dict) else ""
     slice_b = payload.get("slice_b", "") if isinstance(payload, dict) else ""
@@ -4612,7 +4717,7 @@ def import_mapping(contents, vars_a, vars_b):
         or (r.get("path_b") and r["path_b"] not in b_paths)
     )
     status = f"Loaded {len(mapping)} rows." + (f" {missing} paths not found in current files." if missing else "")
-    return mapping, status, slice_a, slice_b
+    return mapping, status, slice_a, slice_b, None
 
 
 # ---------------------------------------------------------------------------
