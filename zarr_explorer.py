@@ -12,7 +12,7 @@ CLI:
     python zarr_explorer.py convert <source> --target-sample <sample> --mapping mapping.json --output <output>
 """
 
-__version__ = "0.5"
+__version__ = "0.6"
 
 import datetime
 import difflib
@@ -898,6 +898,26 @@ def _auto_detect_tolerance(var: dict) -> str:
     return "rel:1e-7"
 
 
+def _enrich_mapping_shapes(mapping: list[dict], vars_a: list[dict] | None,
+                           vars_b: list[dict] | None) -> list[dict]:
+    """Fill shape_a / shape_b on each mapping row by looking up path_a / path_b
+    in the current variable inventories. Missing inventories or paths leave the
+    side blank. Returns a new list of dicts (does not mutate input)."""
+    shapes_a = {v["path"]: v.get("shape", "") for v in (vars_a or [])}
+    shapes_b = {v["path"]: v.get("shape", "") for v in (vars_b or [])}
+    out = []
+    for r in mapping or []:
+        row = dict(r)
+        pa = row.get("path_a") or ""
+        pb = row.get("path_b") or ""
+        if pa and pa in shapes_a:
+            row["shape_a"] = shapes_a[pa]
+        if pb and pb in shapes_b:
+            row["shape_b"] = shapes_b[pb]
+        out.append(row)
+    return out
+
+
 def _auto_match(vars_a: list[dict], vars_b: list[dict]) -> list[dict]:
     """Auto-match variables from file A to file B using name + shape scoring."""
     def _chain_segs(path: str) -> frozenset[str]:
@@ -977,7 +997,10 @@ def _auto_match(vars_a: list[dict], vars_b: list[dict]) -> list[dict]:
 
 
 _TIME_DIM_PATTERNS = re.compile(
-    r"^(time|times|epoch|record|records|n_record|n_records|timestamp|tai|utc)s?$", re.IGNORECASE
+    # Accept the bare name or a "_<suffix>" variant (e.g. time_ka, time_ku,
+    # record_lr) so chain-suffixed time dims still slice.
+    r"^(time|epoch|record|n_record|timestamp|tai|utc)s?(_\w+)?$",
+    re.IGNORECASE,
 )
 
 
@@ -1809,6 +1832,23 @@ def _build_compare_layout() -> html.Div:
                                       style={"fontSize": "10px", "marginLeft": "6px"}),
                         ], style={"display": "flex", "alignItems": "center"}),
 
+                        # Middle: shared spinner, centered between the left
+                        # action group and the right run/slice group (parent
+                        # uses justify-content: space-between, so three
+                        # children land at left / center / right). Fires
+                        # for any long-running action (auto-match, run,
+                        # import, table re-render).
+                        dcc.Loading(
+                            html.Span(id="cmp-busy-marker",
+                                      style={"display": "inline-block",
+                                             "minWidth": "16px"}),
+                            type="circle", color="#0d6efd",
+                            delay_show=200, delay_hide=100,
+                            parent_style={"display": "inline-flex",
+                                          "alignItems": "center",
+                                          "minWidth": "20px"},
+                        ),
+
                         # Right: run config + result downloads
                         html.Div([
                             dbc.Label("A slice", className="text-muted me-1",
@@ -1837,31 +1877,25 @@ def _build_compare_layout() -> html.Div:
                                 style={"fontSize": "11px", "padding": "0", "marginLeft": "6px"},
                             ),
                         ], style={"display": "flex", "alignItems": "center",
-                                  "marginLeft": "auto", "gap": "4px"}),
+                                  "gap": "4px"}),
                     ], style={"display": "flex", "alignItems": "center",
+                              "justifyContent": "space-between",
                               "flexWrap": "wrap", "gap": "6px"}),
 
                     # Sub-row: filter chips + run status
                     html.Div([
                         _cmp_filter_chips(),
-                        dcc.Loading(
-                            html.Span(id="cmp-run-status", className="text-muted",
-                                      style={"fontSize": "11px", "lineHeight": "1"}),
-                            type="circle", color="#0d6efd", delay_show=200,
-                            parent_style={"marginLeft": "auto", "display": "inline-flex",
-                                          "alignItems": "center"},
-                        ),
+                        html.Span(id="cmp-run-status", className="text-muted",
+                                  style={"fontSize": "11px", "lineHeight": "1",
+                                         "marginLeft": "auto"}),
                     ], style={"display": "flex", "alignItems": "center",
                               "marginTop": "6px", "paddingTop": "6px",
                               "borderTop": "1px dashed #e9ecef"}),
                 ]),
                 dbc.CardBody(
-                    dcc.Loading(
-                        html.Div(id="cmp-mapping-area",
-                                 children=html.Span("Load both files and click Auto-match.",
-                                                    className="text-muted small")),
-                        type="circle", color="#0d6efd", delay_show=200,
-                    ),
+                    html.Div(id="cmp-mapping-area",
+                             children=html.Span("Load both files and click Auto-match.",
+                                                className="text-muted small")),
                     class_name="p-2",
                 ),
             ], class_name="border-0 shadow-sm mb-2"),
@@ -3800,6 +3834,7 @@ def update_cmp_info_b(path):
 
 @app.callback(
     Output("cmp-mapping", "data"),
+    Output("cmp-busy-marker", "children", allow_duplicate=True),
     Input("cmp-automatch-btn", "n_clicks"),
     State("cmp-file-a-vars", "data"),
     State("cmp-file-b-vars", "data"),
@@ -3807,8 +3842,8 @@ def update_cmp_info_b(path):
 )
 def auto_match(_n, vars_a, vars_b):
     if not vars_a or not vars_b:
-        return dash.no_update
-    return _auto_match(vars_a, vars_b)
+        return dash.no_update, dash.no_update
+    return _auto_match(vars_a, vars_b), ""
 
 
 @app.callback(
@@ -3886,6 +3921,7 @@ def toggle_download_buttons(results):
 
 @app.callback(
     Output("cmp-mapping-area", "children"),
+    Output("cmp-busy-marker", "children", allow_duplicate=True),
     Input("cmp-mapping", "data"),
     Input("cmp-results", "data"),
     Input("cmp-filter-g1", "value"),
@@ -3896,7 +3932,7 @@ def toggle_download_buttons(results):
 )
 def render_unified_table(mapping, results, g1, g2, g3, vars_b):
     if not mapping:
-        return html.Span("Load both files and click Auto-match.", className="text-muted small")
+        return html.Span("Load both files and click Auto-match.", className="text-muted small"), ""
 
     # The three filter groups are mutually exclusive (sync callback enforces it),
     # so the active filter is whichever group currently has a value set.
@@ -3917,7 +3953,7 @@ def render_unified_table(mapping, results, g1, g2, g3, vars_b):
     if filt and filt != "all":
         rows_indexed = _apply_compare_filter(rows_indexed, filt, results_by_key)
     if not rows_indexed:
-        return html.Span(f"No rows with status '{filt}'.", className="text-muted small")
+        return html.Span(f"No rows with status '{filt}'.", className="text-muted small"), ""
 
     def _fmt(v):
         if v is None:
@@ -3932,25 +3968,32 @@ def render_unified_table(mapping, results, g1, g2, g3, vars_b):
     for idx, r in rows_indexed:
         key = (r.get("path_a", ""), r.get("path_b", ""))
         res = results_by_key.get(key)
-        ca, cb = r.get("crop_a"), r.get("crop_b")
-        if ca and cb:
-            crop_text = f"A: {ca} · B: {cb}"
-        elif ca:
-            crop_text = f"A: {ca}"
-        elif cb:
-            crop_text = f"B: {cb}"
-        else:
-            crop_text = ""
+        # Build the shape cells: show raw (from inventory) and effective
+        # (post-slice/crop, from results) when they differ. Append ✂ when
+        # a per-pair crop is set for that side.
+        raw_a = r.get("shape_a", "")
+        raw_b = r.get("shape_b", "")
+        eff_a = (res or {}).get("shape_a") or ""
+        eff_b = (res or {}).get("shape_b") or ""
+        scissors_a = " ✂" if r.get("crop_a") else ""
+        scissors_b = " ✂" if r.get("crop_b") else ""
+
+        def _shape_cell(raw, eff, scissors):
+            if eff and raw and eff != raw:
+                return f"{raw} → {eff}{scissors}"
+            return f"{(eff or raw)}{scissors}"
+
+        shape_a = _shape_cell(raw_a, eff_a, scissors_a)
+        shape_b = _shape_cell(raw_b, eff_b, scissors_b)
         table_data.append({
             "_idx": idx,
             "_inspect": "🔍",
             "path_a": r.get("path_a", ""),
-            "shape_a": r.get("shape_a", ""),
+            "shape_a": shape_a,
             "path_b": r.get("path_b", ""),
-            "shape_b": r.get("shape_b", ""),
+            "shape_b": shape_b,
             "status": r.get("status", "pending"),
             "tolerance": r.get("tolerance", ""),
-            "crop": crop_text,
             "shape_match": _fmt(res["shape_match"]) if res else "",
             "units_match": _fmt(res["units_match"]) if res else "",
             "rmse": _fmt(res["rmse"]) if res else "",
@@ -3962,6 +4005,17 @@ def render_unified_table(mapping, results, g1, g2, g3, vars_b):
             "n_outside": _fmt(res["n_outside"]) if res else "",
             "warnings": _build_warnings(res) if res else "",
         })
+
+    # Size the shape columns to the widest cell content (11px monospace ≈
+    # 6.6 px/char) so short shapes don't waste space and long ones aren't
+    # truncated. Floor at ~80px (fits the header "Shape A" comfortably).
+    _CH_W = 6.6
+    _PAD = 24
+    _MIN = 80
+    longest_a = max((len(r.get("shape_a", "")) for r in table_data), default=0)
+    longest_b = max((len(r.get("shape_b", "")) for r in table_data), default=0)
+    shape_a_w = f"{max(_MIN, int(longest_a * _CH_W) + _PAD)}px"
+    shape_b_w = f"{max(_MIN, int(longest_b * _CH_W) + _PAD)}px"
 
     return dash_table.DataTable(
         id="cmp-unified-table",
@@ -3976,7 +4030,6 @@ def render_unified_table(mapping, results, g1, g2, g3, vars_b):
             {"name": "Confirm", "id": "status", "editable": True,
              "presentation": "dropdown"},
             {"name": "Tolerance", "id": "tolerance", "editable": True},
-            {"name": "Crop", "id": "crop", "editable": False},
             {"name": "Shape ✓", "id": "shape_match", "editable": False},
             {"name": "Units ✓", "id": "units_match", "editable": False},
             {"name": "RMSE", "id": "rmse", "editable": False},
@@ -4006,11 +4059,12 @@ def render_unified_table(mapping, results, g1, g2, g3, vars_b):
              "maxWidth": "32px", "textAlign": "center", "cursor": "pointer"},
             {"if": {"column_id": "path_a"}, "minWidth": "160px", "maxWidth": "280px"},
             {"if": {"column_id": "path_b"}, "minWidth": "160px", "maxWidth": "280px"},
-            {"if": {"column_id": "shape_a"}, "minWidth": "70px", "maxWidth": "100px"},
-            {"if": {"column_id": "shape_b"}, "minWidth": "70px", "maxWidth": "100px"},
+            {"if": {"column_id": "shape_a"}, "minWidth": shape_a_w,
+             "whiteSpace": "nowrap"},
+            {"if": {"column_id": "shape_b"}, "minWidth": shape_b_w,
+             "whiteSpace": "nowrap"},
             {"if": {"column_id": "status"}, "minWidth": "90px", "maxWidth": "110px"},
             {"if": {"column_id": "tolerance"}, "minWidth": "90px", "maxWidth": "130px"},
-            {"if": {"column_id": "crop"}, "minWidth": "110px", "maxWidth": "180px"},
             {"if": {"column_id": "shape_match"}, "minWidth": "65px", "maxWidth": "75px",
              "textAlign": "center"},
             {"if": {"column_id": "units_match"}, "minWidth": "65px", "maxWidth": "75px",
@@ -4062,12 +4116,13 @@ def render_unified_table(mapping, results, g1, g2, g3, vars_b):
         ),
         page_action="none",
         sort_action="native",
-    )
+    ), ""
 
 
 @app.callback(
     Output("cmp-results", "data"),
     Output("cmp-run-status", "children"),
+    Output("cmp-busy-marker", "children", allow_duplicate=True),
     Input("cmp-run-btn", "n_clicks"),
     State("cmp-mapping", "data"),
     State("cmp-file-a-path", "data"),
@@ -4078,11 +4133,11 @@ def render_unified_table(mapping, results, g1, g2, g3, vars_b):
 )
 def run_comparison(_n, mapping, file_a, file_b, slice_a_str, slice_b_str):
     if not mapping or not file_a or not file_b:
-        return dash.no_update, "Load both files and confirm variable pairs first."
+        return dash.no_update, "Load both files and confirm variable pairs first.", ""
     confirmed = [r for r in mapping if r.get("status") == "confirmed"
                  and r.get("path_a") and r.get("path_b")]
     if not confirmed:
-        return [], "No confirmed pairs to compare. Confirm pairs in the mapping table."
+        return [], "No confirmed pairs to compare. Confirm pairs in the mapping table.", ""
     sl_a = _parse_slice(slice_a_str or "")
     sl_b = _parse_slice(slice_b_str or "")
     results = [_compare_pair(file_a, r["path_a"], file_b, r["path_b"],
@@ -4094,7 +4149,7 @@ def run_comparison(_n, mapping, file_a, file_b, slice_a_str, slice_b_str):
     slice_note = ""
     if sl_a or sl_b:
         slice_note = f" (A slice: {slice_a_str or '—'}, B slice: {slice_b_str or '—'})"
-    return results, f"Done — {len(results)} pairs compared, {n_ok} shape-matched, {n_err} errors.{slice_note}"
+    return results, f"Done — {len(results)} pairs compared, {n_ok} shape-matched, {n_err} errors.{slice_note}", ""
 
 
 @app.callback(
@@ -4179,8 +4234,11 @@ def render_detail_panel(active_cell, log_scale, apply_scale, detail_mode,
     label_a = os.path.basename(file_a.rstrip("/\\"))
     label_b = os.path.basename(file_b.rstrip("/\\"))
 
+    # Use the same formatted shape cell as the variables table (raw → effective ✂).
+    shape_a_disp = clicked.get("shape_a") or row.get("shape_a", "")
+    shape_b_disp = clicked.get("shape_b") or row.get("shape_b", "")
     stats_rows = [
-        ("Shape A / B", f"{row['shape_a']}  /  {row['shape_b']}"),
+        ("Shape A / B", f"{shape_a_disp}  /  {shape_b_disp}"),
         ("RMSE", str(row["rmse"]) if row["rmse"] is not None else "—"),
         ("Max |diff|", str(row["max_abs_diff"]) if row["max_abs_diff"] is not None else "—"),
         ("NaN A / B", f"{row['nan_a']}  /  {row['nan_b']}"),
@@ -4683,6 +4741,7 @@ def export_mapping(_n, mapping, slice_a, slice_b):
     Output("cmp-slice-a", "value"),
     Output("cmp-slice-b", "value"),
     Output("cmp-import-mapping-upload", "contents"),
+    Output("cmp-busy-marker", "children", allow_duplicate=True),
     Input("cmp-import-mapping-upload", "contents"),
     State("cmp-file-a-vars", "data"),
     State("cmp-file-b-vars", "data"),
@@ -4693,7 +4752,7 @@ def import_mapping(contents, vars_a, vars_b):
     # (e.g. import → auto-match → import again) fires the callback again.
     no = dash.no_update
     if not contents:
-        return no, "", no, no, None
+        return no, "", no, no, None, ""
     import json as _json
     import base64 as _b64
     try:
@@ -4701,9 +4760,9 @@ def import_mapping(contents, vars_a, vars_b):
         payload = _json.loads(_b64.b64decode(_data).decode("utf-8"))
         mapping = payload.get("mapping") if isinstance(payload, dict) else payload
         if not isinstance(mapping, list):
-            return no, "Invalid file.", no, no, None
+            return no, "Invalid file.", no, no, None, ""
     except Exception as exc:
-        return no, f"Error: {exc}", no, no, None
+        return no, f"Error: {exc}", no, no, None, ""
 
     slice_a = payload.get("slice_a", "") if isinstance(payload, dict) else ""
     slice_b = payload.get("slice_b", "") if isinstance(payload, dict) else ""
@@ -4717,7 +4776,25 @@ def import_mapping(contents, vars_a, vars_b):
         or (r.get("path_b") and r["path_b"] not in b_paths)
     )
     status = f"Loaded {len(mapping)} rows." + (f" {missing} paths not found in current files." if missing else "")
-    return mapping, status, slice_a, slice_b, None
+    mapping = _enrich_mapping_shapes(mapping, vars_a, vars_b)
+    return mapping, status, slice_a, slice_b, None, ""
+
+
+@app.callback(
+    Output("cmp-mapping", "data", allow_duplicate=True),
+    Output("cmp-busy-marker", "children", allow_duplicate=True),
+    Input("cmp-file-a-vars", "data"),
+    Input("cmp-file-b-vars", "data"),
+    State("cmp-mapping", "data"),
+    prevent_initial_call=True,
+)
+def refresh_mapping_shapes(vars_a, vars_b, mapping):
+    """When file inventories change (file loaded/unloaded), refill the
+    shape_a / shape_b on the current mapping so rows imported before the
+    files were open still get raw shapes."""
+    if not mapping:
+        return dash.no_update, dash.no_update
+    return _enrich_mapping_shapes(mapping, vars_a, vars_b), ""
 
 
 # ---------------------------------------------------------------------------
