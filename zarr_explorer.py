@@ -4596,7 +4596,9 @@ def _build_csv_report(results: list, file_a: str, file_b: str,
     writer.writerow(["file_a", "file_b", "generated"])
     writer.writerow([file_a, file_b, datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")])
     writer.writerow([])
-    writer.writerow(["variable_a", "variable_b", "shape_a", "shape_b", "shape_match",
+    writer.writerow(["variable_a", "variable_b",
+                     "crop_a", "crop_b",
+                     "shape_a", "shape_b", "shape_match",
                      "units_a", "units_b", "units_match",
                      "rmse", "max_abs_diff", "nan_delta",
                      "n_perfect", "n_within", "n_outside", "tol_status", "warnings"])
@@ -4607,6 +4609,7 @@ def _build_csv_report(results: list, file_a: str, file_b: str,
     for r in results:
         writer.writerow([
             r["path_a"], r["path_b"],
+            r.get("crop_a") or "", r.get("crop_b") or "",
             r.get("shape_a", ""), r.get("shape_b", ""),
             "yes" if r.get("shape_match") else "no",
             r.get("units_a", ""), r.get("units_b", ""),
@@ -4617,9 +4620,9 @@ def _build_csv_report(results: list, file_a: str, file_b: str,
         ])
 
     for path in (unmatched_a or []):
-        writer.writerow([path, "", "", "", "", "", "", "", "", "", "", "", "", "", "unmatched_a", ""])
+        writer.writerow([path, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "unmatched_a", ""])
     for path in (unmatched_b or []):
-        writer.writerow(["", path, "", "", "", "", "", "", "", "", "", "", "", "", "unmatched_b", ""])
+        writer.writerow(["", path, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "unmatched_b", ""])
 
     return out.getvalue()
 
@@ -4646,18 +4649,30 @@ def _build_html_report(results: list, file_a: str, file_b: str,
         "<h1>File comparison report</h1>",
         f"<p><b>File A:</b> {_esc(file_a or '')}<br><b>File B:</b> {_esc(file_b or '')}<br>"
         f"<b>Generated:</b> {ts} — {len(results)} pairs compared</p>",
-        "<table><thead><tr><th>Variable A</th><th>Variable B</th><th>Shape match</th>"
-        "<th>Units match</th><th>RMSE</th><th>Max |diff|</th><th>NaN Δ</th><th>Tol. status</th><th>Warnings</th></tr></thead><tbody>",
+        "<table><thead><tr><th>Variable A</th><th>Variable B</th><th>Crop</th>"
+        "<th>Shape match</th><th>Units match</th><th>RMSE</th><th>Max |diff|</th>"
+        "<th>NaN Δ</th><th>Status</th><th>Warnings</th></tr></thead><tbody>",
     ]
 
     def _fmt(v):
         return "—" if v is None else (f"{v:.6g}" if isinstance(v, float) else str(v))
+
+    def _crop_cell(r):
+        ca, cb = r.get("crop_a"), r.get("crop_b")
+        if ca and cb:
+            return f"✂ A: {ca} · B: {cb}"
+        if ca:
+            return f"✂ A: {ca}"
+        if cb:
+            return f"✂ B: {cb}"
+        return ""
 
     for r in results:
         cls = "err" if r.get("error") else ("ok" if r["shape_match"] else "warn")
         parts.append(
             f"<tr class='{cls}'>"
             f"<td>{_esc(r['path_a'])}</td><td>{_esc(r['path_b'])}</td>"
+            f"<td>{_esc(_crop_cell(r))}</td>"
             f"<td>{'✓' if r['shape_match'] else '✗'}</td>"
             f"<td>{'✓' if r['units_match'] else '✗'}</td>"
             f"<td>{_fmt(r['rmse'])}</td><td>{_fmt(r['max_abs_diff'])}</td>"
@@ -4687,7 +4702,10 @@ def _build_html_report(results: list, file_a: str, file_b: str,
             continue
         parts.append(f"<h2>{_esc(r['path_a'])}  vs  {_esc(r['path_b'])}</h2>")
         try:
-            fig_overlay, fig_diff, _ = _make_compare_figures(file_a, r["path_a"], file_b, r["path_b"])
+            fig_overlay, fig_diff, _ = _make_compare_figures(
+                file_a, r["path_a"], file_b, r["path_b"],
+                crop_a=r.get("crop_a"), crop_b=r.get("crop_b"),
+            )
             for fig, title in [(fig_overlay, f"{r['path_a']}  vs  {r['path_b']}"),
                                (fig_diff, "A − B")]:
                 if fig:
@@ -4903,8 +4921,17 @@ def _cli_compare(args: "argparse.Namespace") -> None:
         results.append(r)
         status = r.get("tol_status", "—")
         warn = _build_warnings(r)
+        ca, cb = row.get("crop_a"), row.get("crop_b")
+        if ca and cb:
+            crop_note = f"  ✂ A:{ca} B:{cb}"
+        elif ca:
+            crop_note = f"  ✂ A:{ca}"
+        elif cb:
+            crop_note = f"  ✂ B:{cb}"
+        else:
+            crop_note = ""
         print(f"  [{i:>3}/{len(confirmed)}] {row['path_a']!s:<50}  {status}" +
-              (f"  ⚠ {warn}" if warn else ""))
+              crop_note + (f"  ⚠ {warn}" if warn else ""))
 
     file_b_vars = _get_file_vars(args.file_b)
     unmatched_a, unmatched_b = _compute_unmatched(mapping, file_b_vars)
