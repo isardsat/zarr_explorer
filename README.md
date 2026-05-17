@@ -1,6 +1,6 @@
 # Zarr Explorer
 
-**Version 0.5** — A browser-based viewer and comparator for Zarr and NetCDF files, built with Dash/Plotly. Also usable as a CLI tool.
+**Version 0.6** — A browser-based viewer and comparator for Zarr and NetCDF files, built with Dash/Plotly. Also usable as a CLI tool.
 
 ## Features
 
@@ -23,17 +23,22 @@
 
 ### Compare tab
 - Load two Zarr or NetCDF files and auto-match variables by name/path
-- Manual match override via in-table dropdown
+- Manual match override via in-table dropdown (supports 1-to-many — the same A variable mapped to several B variables)
 - Tolerance-aware comparison: `exact` (integers/flags), `abs:<value>` (scaled), `rel:<value>` (floats)
   - Auto-detected from variable metadata (EOPF logical dtype, scale_factor)
   - Editable per variable in the table
-- Color-coded results: green (perfect), yellow (within tolerance), orange (outside tolerance)
+- Color-coded results: green (perfect), light blue (within tolerance), orange (outside tolerance)
 - Per-variable counts: # perfect, # within tolerance, # outside tolerance
+- Shape cell shows `raw → effective ✂` when a slice or per-pair crop reduces the data, with a scissors marker for the cropped sides
 - Time dimension slicing: apply independent `start:stop:step` slices to file A and B before comparison
-- Detail panel on click: overlay plot, difference plot, attribute diff, value table
+- Per-pair crop specs: when A and B have different trailing-dim sizes (e.g. padded zarr waveforms), set `crop_a` / `crop_b` in the mapping JSON (numpy-style slice spec like `"[:, :256]"`) to align them before comparison
+- Inspect column (🔍) opens a detail panel on click with:
+  - Overlay plot (A vs B) and difference plot (A − B), with Log and CF-scale toggles
+  - For 2D variables: "View along" radio + index input to fix one axis at a chosen position; A / B / A−B switch and Full-table toggle in the values table
+  - Side-by-side attribute table (A vs B columns) flagging differences
 - Warnings column: NaN mismatches, comparison errors, slice ignored
-- Export/import variable mapping as JSON — minimal format (path_a, path_b, status, tolerance, slices)
-- Download HTML or CSV comparison report (includes unmatched variables from both files)
+- Export/import variable mapping as JSON — minimal format (path_a, path_b, status, tolerance, slices, optional crop_a / crop_b)
+- Download HTML or CSV comparison report (includes unmatched variables from both files, plus per-pair crop info)
 - Compare zarr `other_metadata` scalar fields as virtual variables (`group/.meta/other_metadata/key`)
 
 ### CLI
@@ -57,7 +62,7 @@ python zarr_explorer.py convert file_b.nc --target-sample file_a.zarr --mapping 
 python zarr_explorer.py convert file_b.nc --target-sample file_a.zarr --mapping mapping.json --output output.zarr --zarr-format 2
 ```
 
-CLI compare output includes unmatched variables from both files. Defaults to HTML if neither `--html` nor `--csv` is given.
+CLI compare output includes unmatched variables from both files. Pairs with `crop_a` / `crop_b` set in the mapping are noted on the per-pair progress line with `✂ A:<spec> B:<spec>`, and the resulting HTML / CSV reports include a Crop column. Defaults to HTML if neither `--html` nor `--csv` is given.
 
 ### Convert
 
@@ -128,3 +133,20 @@ Standard Python slice notation:
 | `1:7:2` | Elements 1, 3, 5 |
 
 In the Compare tab, slices are applied to the time/record dimension of each file independently. Variables without a matching dimension are compared as-is.
+
+## Per-pair crop syntax
+
+For cases where A and B have different trailing-dim sizes (e.g. zarr waveforms padded to 2048 samples vs. NetCDF kept at 256), add `crop_a` and / or `crop_b` to a mapping row to trim either side before comparison. Each value is a numpy-style slice spec applied to the loaded array, in brackets:
+
+```json
+{
+  "path_a": "measurements/ka/power_waveform",
+  "path_b": "data_20/ka/power_waveform_rx1",
+  "status": "confirmed",
+  "tolerance": "abs:1",
+  "crop_a": "[:, :256]",
+  "crop_b": "[:, :256]"
+}
+```
+
+Crops apply after the global time slice and before the comparison. The Variables table marks cropped pairs with a scissors (✂) marker in the shape cell, and the HTML / CSV reports include the crop specs in a dedicated column.
