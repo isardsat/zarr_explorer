@@ -815,11 +815,12 @@ def _get_file_vars(path: str) -> list[dict]:
         def _collect_meta_scalars(node: zarr.Group, grp_path: str = "") -> None:
             if not isinstance(node, zarr.Group):
                 return
-            other_meta = dict(node.attrs).get("other_metadata", {})
+            _om = dict(node.attrs).get("other_metadata", {})
+            other_meta = _om.get("data_information", {}) if isinstance(_om, dict) else {}
             if isinstance(other_meta, dict):
                 for key, val in other_meta.items():
                     if isinstance(val, dict) and "data" in val and val.get("dims") == []:
-                        meta_path = f"{grp_path}/.meta/other_metadata/{key}" if grp_path else f".meta/other_metadata/{key}"
+                        meta_path = f"{grp_path}/.meta/other_metadata/data_information/{key}" if grp_path else f".meta/other_metadata/data_information/{key}"
                         meta_attrs = val.get("attrs", {})
                         result.append({
                             "path": meta_path,
@@ -1198,13 +1199,15 @@ def _load_var_data(file_path: str, var_path: str, apply_scale: bool = True,
             grp_path = ""
         else:
             grp_path, rest = var_path.split("/.meta/", 1)
-        # rest is "other_metadata/key" or legacy "key"
-        rest_parts = rest.split("/", 1)
-        meta_source, key = (rest_parts[0], rest_parts[1]) if len(rest_parts) == 2 else ("other_metadata", rest_parts[0])
+        # rest is "other_metadata/data_information/key" — navigate nested dicts
+        rest_segments = rest.split("/")
+        key = rest_segments[-1]
         s = zarr.open(file_path, mode="r")
         grp = s[grp_path] if grp_path else s
-        other_meta = dict(grp.attrs).get(meta_source, {})
-        entry = other_meta.get(key, {})
+        obj = dict(grp.attrs)
+        for seg in rest_segments[:-1]:
+            obj = obj.get(seg, {}) if isinstance(obj, dict) else {}
+        entry = obj.get(key, {}) if isinstance(obj, dict) else {}
         if not isinstance(entry, dict) or "data" not in entry:
             raise KeyError(f"other_metadata key not found: {key}")
         try:
@@ -1265,11 +1268,13 @@ def _load_var_data(file_path: str, var_path: str, apply_scale: bool = True,
             group = "/".join(parts[:-1])
             var_name = parts[-1]
             ds = xr.open_dataset(file_path, engine="netcdf4", group=group,
-                                  mask_and_scale=bool(apply_scale))
+                                  mask_and_scale=bool(apply_scale),
+                                  decode_times=False)
         else:
             var_name = var_path
             ds = xr.open_dataset(file_path, engine="netcdf4",
-                                  mask_and_scale=bool(apply_scale))
+                                  mask_and_scale=bool(apply_scale),
+                                  decode_times=False)
         var = ds[var_name]
         # detect time dim by name from xarray dimension names
         axis: int | None = None
@@ -4022,24 +4027,24 @@ def render_unified_table(mapping, results, g1, g2, g3, vars_b):
         data=table_data,
         columns=[
             {"name": "ⓘ", "id": "_inspect", "editable": False},
-            {"name": "Variable A", "id": "path_a", "editable": False},
-            {"name": "Shape A", "id": "shape_a", "editable": False},
+            {"name": "Variable A", "id": "path_a", "editable": False, "resizable": True},
+            {"name": "Shape A", "id": "shape_a", "editable": False, "resizable": True},
             {"name": "Variable B", "id": "path_b", "editable": True,
-             "presentation": "dropdown"},
-            {"name": "Shape B", "id": "shape_b", "editable": False},
+             "presentation": "dropdown", "resizable": True},
+            {"name": "Shape B", "id": "shape_b", "editable": False, "resizable": True},
             {"name": "Confirm", "id": "status", "editable": True,
-             "presentation": "dropdown"},
-            {"name": "Tolerance", "id": "tolerance", "editable": True},
-            {"name": "Shape ✓", "id": "shape_match", "editable": False},
-            {"name": "Units ✓", "id": "units_match", "editable": False},
-            {"name": "RMSE", "id": "rmse", "editable": False},
-            {"name": "Max |diff|", "id": "max_abs_diff", "editable": False},
-            {"name": "NaN Δ", "id": "nan_delta", "editable": False},
-            {"name": "# perfect", "id": "n_perfect", "editable": False},
-            {"name": "# within", "id": "n_within", "editable": False},
-            {"name": "# outside", "id": "n_outside", "editable": False},
-            {"name": "Status", "id": "tol_status", "editable": False},
-            {"name": "Warnings", "id": "warnings", "editable": False},
+             "presentation": "dropdown", "resizable": True},
+            {"name": "Tolerance", "id": "tolerance", "editable": True, "resizable": True},
+            {"name": "Shape ✓", "id": "shape_match", "editable": False, "resizable": True},
+            {"name": "Units ✓", "id": "units_match", "editable": False, "resizable": True},
+            {"name": "RMSE", "id": "rmse", "editable": False, "resizable": True},
+            {"name": "Max |diff|", "id": "max_abs_diff", "editable": False, "resizable": True},
+            {"name": "NaN Δ", "id": "nan_delta", "editable": False, "resizable": True},
+            {"name": "# perfect", "id": "n_perfect", "editable": False, "resizable": True},
+            {"name": "# within", "id": "n_within", "editable": False, "resizable": True},
+            {"name": "# outside", "id": "n_outside", "editable": False, "resizable": True},
+            {"name": "Status", "id": "tol_status", "editable": False, "resizable": True},
+            {"name": "Warnings", "id": "warnings", "editable": False, "resizable": True},
         ],
         dropdown={
             "path_b": {"options": b_path_opts, "clearable": True},
@@ -4057,8 +4062,8 @@ def render_unified_table(mapping, results, g1, g2, g3, vars_b):
         style_cell_conditional=[
             {"if": {"column_id": "_inspect"}, "width": "32px", "minWidth": "32px",
              "maxWidth": "32px", "textAlign": "center", "cursor": "pointer"},
-            {"if": {"column_id": "path_a"}, "minWidth": "160px", "maxWidth": "280px"},
-            {"if": {"column_id": "path_b"}, "minWidth": "160px", "maxWidth": "280px"},
+            {"if": {"column_id": "path_a"}, "minWidth": "160px", "width": "220px"},
+            {"if": {"column_id": "path_b"}, "minWidth": "160px", "width": "220px"},
             {"if": {"column_id": "shape_a"}, "minWidth": shape_a_w,
              "whiteSpace": "nowrap"},
             {"if": {"column_id": "shape_b"}, "minWidth": shape_b_w,
@@ -5110,25 +5115,31 @@ def _write_nc_var(ds_out, var_path: str, data: np.ndarray, attrs: dict, dim_name
 def _write_zarr_var(root: zarr.Group, var_path: str, data: np.ndarray, attrs: dict) -> None:
     """Write data to a zarr array at var_path, creating groups as needed.
 
-    Handles virtual other_metadata paths (group/.meta/other_metadata/key) by
+    Handles virtual other_metadata paths (group/.meta/other_metadata/data_information/key) by
     writing into the group's other_metadata attribute dict rather than creating an array.
     """
     # Virtual other_metadata path → update group attribute dict
-    if "/.meta/other_metadata/" in var_path or var_path.startswith(".meta/other_metadata/"):
+    if "/.meta/other_metadata/data_information/" in var_path or var_path.startswith(".meta/other_metadata/data_information/"):
         if var_path.startswith(".meta/other_metadata/"):
-            grp_path, key = "", var_path.split("other_metadata/", 1)[1]
+            grp_path, key = "", var_path.split("other_metadata/data_information/", 1)[1]
         else:
-            grp_path, key = var_path.split("/.meta/other_metadata/", 1)
+            grp_path, key = var_path.split("/.meta/other_metadata/data_information/", 1)
         grp = root
         if grp_path:
             for part in grp_path.split("/"):
                 grp = grp.require_group(part)
-        existing: dict = dict(grp.attrs).get("other_metadata", {})
+        existing_om: dict = dict(grp.attrs).get("other_metadata", {})
+        if not isinstance(existing_om, dict):
+            existing_om = {}
+        existing_di: dict = existing_om.get("data_information", {})
+        if not isinstance(existing_di, dict):
+            existing_di = {}
         val = data.item() if hasattr(data, "item") else float(data)
         meta_attrs = {k: v for k, v in attrs.items()
                       if k not in _ZARR_WRITE_SKIP_ATTRS | {"scale_factor", "add_offset", "_FillValue"}}
-        existing[key] = {"data": val, "dims": [], "attrs": meta_attrs}
-        grp.attrs["other_metadata"] = existing
+        existing_di[key] = {"data": val, "dims": [], "attrs": meta_attrs}
+        existing_om["data_information"] = existing_di
+        grp.attrs["other_metadata"] = existing_om
         return
 
     # Regular array path
@@ -5149,7 +5160,14 @@ def _write_zarr_var(root: zarr.Group, var_path: str, data: np.ndarray, attrs: di
         create_kw["chunks"] = chunks
     if compressor is not None:
         create_kw["compressor"] = compressor
-    arr = grp.create_array(var_name, **create_kw)
+    try:
+        arr = grp.create_array(var_name, **create_kw)
+    except Exception as _e:
+        if "compressor" in create_kw and "BytesBytesCodec" in str(_e):
+            del create_kw["compressor"]
+            arr = grp.create_array(var_name, **create_kw)
+        else:
+            raise
     if data.ndim == 0:
         arr[()] = data.item()
     else:
